@@ -329,13 +329,22 @@ def _approve(state: dict, selected: Optional[str]):
     return _format_scan_result(target)  # 兜底
 
 
-def _ui_submit(message: str, chat, state):
-    state = _ensure(state)
+def _ui_add_user(message: str, chat):
+    """第一步（秒回）：立刻把用户消息显示到聊天区并清空输入框。"""
     chat = list(chat or [])
     msg = (message or "").strip()
-    if not msg:
-        return chat, "", *_controls([], [])
-    chat.append({"role": "user", "content": msg})
+    if msg:
+        chat.append({"role": "user", "content": msg})
+    return chat, ""
+
+
+def _ui_bot(chat, state):
+    """第二步（可能耗时）：读最后一条用户消息，跑 agent / 处理授权，补回复。"""
+    state = _ensure(state)
+    chat = list(chat or [])
+    if not chat or chat[-1].get("role") != "user":
+        return chat, *_controls(state.get("pending"), state.get("candidates"))
+    msg = chat[-1]["content"]
 
     # 有待授权时，也支持打字「同意/取消」（与按钮等效）。
     if state.get("pending") and _is_affirmative(msg):
@@ -352,7 +361,7 @@ def _ui_submit(message: str, chat, state):
         state["candidates"] = candidates
 
     chat.append({"role": "assistant", "content": reply})
-    return chat, "", *_controls(pending, candidates)
+    return chat, *_controls(pending, candidates)
 
 
 def _ui_approve(chat, state, selected):
@@ -396,11 +405,14 @@ def build_demo() -> "gr.Blocks":
             msg = gr.Textbox(placeholder="扫一下 sentinel-sample-app", show_label=False, scale=8, autofocus=True)
             send = gr.Button("发送", variant="primary", scale=1)
 
-        outs_submit = [chatbot, msg, cand_radio, approve_btn, deny_btn]
-        send.click(_ui_submit, [msg, chatbot, state], outs_submit, api_name=False)
-        msg.submit(_ui_submit, [msg, chatbot, state], outs_submit, api_name=False)
-
         outs_btn = [chatbot, cand_radio, approve_btn, deny_btn]
+        # 两步：先秒回显示用户消息+清空输入框，再 .then() 跑 agent 补回复。
+        add_io = ([msg, chatbot], [chatbot, msg])
+        send.click(_ui_add_user, *add_io, api_name=False).then(
+            _ui_bot, [chatbot, state], outs_btn, api_name=False)
+        msg.submit(_ui_add_user, *add_io, api_name=False).then(
+            _ui_bot, [chatbot, state], outs_btn, api_name=False)
+
         approve_btn.click(_ui_approve, [chatbot, state, cand_radio], outs_btn, api_name=False)
         deny_btn.click(_ui_deny, [chatbot, state], outs_btn, api_name=False)
 
