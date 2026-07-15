@@ -11,6 +11,7 @@ from typing import Optional
 
 from sentinel import __version__
 from sentinel.llm import LLMClient
+from sentinel.engines.scan import scan_repo, signals_of
 
 # 系统提示：定义这个 Agent 的身份。后续会逐步丰富。
 SYSTEM_PROMPT = "你是 Sentinel，一个可观测性守护 Agent 的雏形。用中文简洁回答。"
@@ -26,6 +27,20 @@ def cmd_ping(args: argparse.Namespace) -> None:
     print(reply)
 
 
+def cmd_scan(args: argparse.Namespace) -> None:
+    """扫描仓库，列出监控盲区（纯静态，不用 LLM）。"""
+    result = scan_repo(args.repo)
+    blind = result.blind_spots
+    print(f"扫描 {args.repo}：共 {len(result.units)} 个函数/方法，发现 {len(blind)} 个监控盲区\n")
+    for u in blind:
+        sigs = "/".join(signals_of(u))
+        print(f"  ⚠ {u.file}::{u.qualname}  [{sigs}]  行 {u.start_line}-{u.end_line}")
+        print(f"     调用: {', '.join(u.calls)}")
+    if not blind:
+        print("  ✅ 未发现盲区（或仓库无可观测性相关调用）")
+
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sentinel",
@@ -37,6 +52,10 @@ def build_parser() -> argparse.ArgumentParser:
     ping = sub.add_parser("ping", help="向 LLM 发一句话，验证链路是否打通")
     ping.add_argument("message", help="要发送的内容")
     ping.set_defaults(func=cmd_ping)
+
+    scan = sub.add_parser("scan", help="扫描仓库，列出监控盲区（纯静态，不用 LLM）")
+    scan.add_argument("repo", help="仓库路径或单个 .py 文件")
+    scan.set_defaults(func=cmd_scan)
 
     return parser
 
