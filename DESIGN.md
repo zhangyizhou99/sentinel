@@ -172,7 +172,8 @@ VectorStore(port)  ← 上层只认接口
 
 | 工具 | 输入 → 输出 | 破坏性 | 章节 |
 |---|---|---|---|
-| `scan` | repo → CodeUnit 列表 + 缺埋点清单 | 否 | 2 |
+| `find_repo` | 关键词 → 工作区内匹配目录的绝对路径列表（只列名，不读内容） | 否 | 2/14 |
+| `scan` | repo → CodeUnit 列表 + 缺埋点清单（**读代码内容，需授权门**） | 否 | 2 |
 | `retrieve` | query → top-K 相关代码单元（含证据） | 否 | 8 |
 | `judge_intent` | 代码单元 + 上下文 → 是否重要/该打什么点 + 置信度 + 引用 | 否 | 4/9 |
 | `gen_alert` | 指标 → PromQL/KQL 告警规则（含分级 Sev） | 否 | — |
@@ -355,6 +356,18 @@ flowchart LR
 
 **与其他安全面的分工**：§7.3 防幻觉（吹错）、§13 容错（跑失败）、本节防**越权/泄密**（做坏事）。
 **Future**：若上 MCP/多用户，加 per-user token 与 RBAC；工具级权限声明（每个工具声明需要哪类凭据）。
+
+### 14.1 已落地：读文件的权限门（find_repo / scan）
+
+第一块真正实现的权限隔离——「读懂他人代码」这件事本身就敏感，落地成两级 + 人审同意：
+
+- **范围边界 `workspace_root`**（`config.workspace_root()`，默认 = 启动目录，`SENTINEL_WORKSPACE_ROOT` 覆盖）：`find_repo`/`scan` 只能在此根内活动，越界返回 `denied`。
+- **两级权限**：`find_repo` 只列**目录名**（低风险）→ 在 scope 内免授权；`scan` 读**代码内容**（高风险）→ 未授权返回 `permission_required`。
+- **人审同意（human-in-the-loop）**：`PermissionBroker`（按会话保存已授权路径）。Web 里授权 = 一个对话回合——agent 找到路径后停下请求授权，用户回「同意」才继续 `scan`。
+- **不可自我提权**：`broker.grant()` 只接受 scope 内路径；越界授权直接 `PermissionError`。
+- **隐含同意例外**：CLI `sentinel scan <path>`（用户显式发起）不设门（`build_scan_tool(broker=None)`）。
+
+代码：`permissions.py`（PermissionBroker）、`engines/agent_tools.py`（find_repo + scan 门）、`webapp.py`（授权回合）。
 
 ---
 

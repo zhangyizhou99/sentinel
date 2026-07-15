@@ -67,3 +67,15 @@ class LLMConfig:
             model=os.getenv("SENTINEL_MODEL") or preset.get("default_model"),
             temperature=float(os.getenv("SENTINEL_TEMPERATURE", "0.2")),
         )
+
+
+def workspace_root() -> str:
+    """Agent 被允许「找项目 / 读代码」的根目录（权限边界 · DESIGN §14）。
+
+    默认 = 启动 Sentinel 的当前目录（直觉：它只看你把它放进去的那个工作区）；
+    可用 SENTINEL_WORKSPACE_ROOT 覆盖。所有文件访问都不得越出这个根。
+    """
+    return os.path.abspath(os.path.expanduser(
+        os.getenv("SENTINEL_WORKSPACE_ROOT") or os.getcwd()
+    ))
+
