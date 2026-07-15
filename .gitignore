@@ -1,0 +1,13 @@
+# 密钥与本地配置（绝不提交）
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Sentinel 运行时产物
+.sentinel/

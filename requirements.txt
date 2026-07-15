@@ -1,0 +1,7 @@
+# 运行时依赖，尽量精简。openai 与 python-dotenv 都是可选增强：
+# 没装 openai 也能跑（离线降级）；没装 dotenv 也能读系统环境变量。
+python-dotenv>=1.0
+openai>=1.0
+
+# 开发/测试
+pytest>=7.0
