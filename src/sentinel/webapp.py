@@ -10,9 +10,30 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import subprocess
 from typing import List, Optional
+from urllib.parse import quote
 
 import gradio as gr
+
+# --- Gradio 4.44 已知 bug 兜底 ---------------------------------------------
+# gradio_client 生成 API schema 时，遇到布尔型 schema（如 additionalProperties: true）
+# 会抛 TypeError: argument of type 'bool' is not iterable，进而让启动自检误报
+# 「localhost 不可达」导致退出。打个补丁：布尔 schema 一律当作 Any。
+try:  # pragma: no cover - 纯环境兜底
+    import gradio_client.utils as _gcu
+
+    _ORIG_J2P = _gcu._json_schema_to_python_type
+
+    def _safe_json_schema_to_python_type(schema, defs=None):
+        if isinstance(schema, bool):
+            return "Any"
+        return _ORIG_J2P(schema, defs)
+
+    _gcu._json_schema_to_python_type = _safe_json_schema_to_python_type
+except Exception:  # noqa: BLE001
+    pass
 
 from sentinel.config import workspace_root
 from sentinel.engines.agent import AgentCore, AgentRun
@@ -23,6 +44,19 @@ from sentinel.permissions import PermissionBroker
 
 # 全局单例：LLM 客户端（无 key 时 available=False，走降级路径，不崩）。
 _LLM = LLMClient()
+
+# 已授权可「打开文件」的路径集合（服务端级）。与 scan 授权一致：只有用户
+# 同意扫描过（或降级模式下显式发起扫描）的目录，其文件才允许被 /open 打开。
+_AUTHORIZED_PATHS: set = set()
+
+
+def _authorize_open(path: str) -> None:
+    """登记一个已授权目录（其下文件之后可被 /open 打开）。"""
+    _AUTHORIZED_PATHS.add(os.path.abspath(path))
+
+
+def _is_open_authorized(ap: str) -> bool:
+    return any(ap == g or ap.startswith(g + os.sep) for g in _AUTHORIZED_PATHS)
 
 
 def _build_agent(broker: PermissionBroker) -> AgentCore:
@@ -45,11 +79,36 @@ def _scan_reports(run: AgentRun) -> List[dict]:
     return reports
 
 
-def _vscode_link(repo: str, rel_file: str, lines: str) -> str:
-    """拼一个 VS Code 深链：点击直接在编辑器里跳到该文件对应行。"""
+def _open_link(repo: str, rel_file: str, lines: str) -> str:
+    """拼一个指向本机服务 /open 端点的相对链接。
+
+    为什么不用 vscode:// ：Gradio 前端会把非 http 的自定义协议链接过滤掉（点不动）。
+    改成同源 http 链接就不会被清洗；点击时服务端用 code -g 打开（见 /open 路由）。
+    """
     abspath = rel_file if os.path.isabs(rel_file) else os.path.join(repo or "", rel_file)
     start = str(lines or "1").split("-")[0].strip() or "1"
-    return f"vscode://file{abspath}:{start}"
+    return f"/open?path={quote(abspath)}&line={start}"
+
+
+def _open_in_editor(path: str, line: int) -> None:
+    """服务端在本机用 VS Code 打开文件到指定行。
+
+    双重门（§14）：既要在工作区范围内，又要该目录**已被授权**（与 scan 一致）——
+    没授权过的仓库文件一律不开，即使有人构造链接也没用。
+    """
+    root = workspace_root()
+    ap = os.path.abspath(path)
+    in_scope = ap == root or ap.startswith(root + os.sep)
+    if not (in_scope and _is_open_authorized(ap)) or not os.path.exists(ap):
+        return  # 越界 / 未授权 / 不存在 → 忽略，不打开
+    code = shutil.which("code")
+    try:
+        if code:  # 有 code CLI 最直接
+            subprocess.run([code, "-g", f"{ap}:{line}"], check=False)
+        else:      # 否则 macOS 用 open 把 vscode:// URI 交给系统路由到 VS Code（无需 code 命令）
+            subprocess.run(["open", f"vscode://file{ap}:{line}"], check=False)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _render_report(data: dict) -> str:
@@ -63,7 +122,7 @@ def _render_report(data: dict) -> str:
     rows = ["| 文件（点击在 VS Code 打开） | 函数 | 风险信号 | 行 |", "| --- | --- | --- | --- |"]
     for b in spots:
         sig = ", ".join(b.get("signals", [])) or "-"
-        link = _vscode_link(repo, b.get("file", ""), b.get("lines", ""))
+        link = _open_link(repo, b.get("file", ""), b.get("lines", ""))
         file_cell = f"[{b.get('file', '?')}]({link})"
         rows.append(f"| {file_cell} | `{b.get('function', '?')}` | {sig} | {b.get('lines', '?')} |")
     return head + "\n\n" + "\n".join(rows)
@@ -113,7 +172,7 @@ def _format_scan_result(path: str) -> str:
         return head + "\n\n✅ 没有明显盲区。"
     rows = ["| 文件（点击在 VS Code 打开） | 函数 | 风险信号 | 行 |", "| --- | --- | --- | --- |"]
     for u in spots[:30]:
-        link = _vscode_link(path, u.file, f"{u.start_line}-{u.end_line}")
+        link = _open_link(path, u.file, f"{u.start_line}-{u.end_line}")
         file_cell = f"[{u.file}]({link})"
         rows.append(f"| {file_cell} | `{u.qualname}` | {', '.join(signals_of(u)) or '-'} | {u.start_line}-{u.end_line} |")
     return head + "\n\n" + "\n".join(rows)
@@ -294,6 +353,7 @@ def _agent_turn(state: dict, goal: str):
         path = _extract_path(goal)
         note = f"_（无 LLM key，纯扫描模式：{_LLM.why_unavailable()}）_\n\n"
         if path and broker.within_scope(path):
+            _authorize_open(path)  # 显式发起扫描 = 隐含同意，其文件可被 /open 打开
             return note + _format_scan_result(path), [], []
         if path:
             return note + f"⚠️ `{path}` 超出允许范围（{broker.root}）。", [], []
@@ -323,6 +383,7 @@ def _approve(state: dict, selected: Optional[str]):
         broker.grant(target)
     except PermissionError as e:
         return f"⛔ {e}"
+    _authorize_open(target)  # 授权成功 → 其下文件今后可被 /open 打开
     report = build_scan_tool(broker).func(target)
     if isinstance(report, dict) and "blind_spots" in report:
         return _render_report(report)
@@ -419,5 +480,22 @@ def build_demo() -> "gr.Blocks":
     return demo
 
 
+def run(host: str = "127.0.0.1", port: int = 7860) -> None:
+    """启动：把 Gradio 挂在自建 FastAPI 上，额外提供 /open 端点（点文件名打开 VS Code）。"""
+    import uvicorn
+    from fastapi import FastAPI, Response
+
+    app = FastAPI()
+
+    @app.get("/open")
+    def _open(path: str, line: int = 1):  # noqa: ANN202
+        _open_in_editor(path, line)
+        # 204 No Content：点链接后浏览器不跳转、对话不丢，只默默打开编辑器。
+        return Response(status_code=204)
+
+    app = gr.mount_gradio_app(app, build_demo(), path="/")
+    uvicorn.run(app, host=host, port=port)
+
+
 if __name__ == "__main__":
-    build_demo().launch(show_api=False)
+    run()

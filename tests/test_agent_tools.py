@@ -61,3 +61,11 @@ def test_find_repo_locates_directory():
     assert any(m.endswith("fixtures") for m in res["matches"])
     assert res["root"] == str(_TESTS)
 
+
+def test_find_repo_exact_match_is_unique():
+    # 目录名精确等于关键词时，只返回它一个（不被同名子串项淹没）。
+    broker = PermissionBroker(str(_TESTS))
+    tool = build_find_repo_tool(broker)
+    res = tool.func("fixtures")
+    assert res["matches"] == [str(_FIXTURES)]
+

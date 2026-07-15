@@ -61,18 +61,36 @@ def build_find_repo_tool(broker: PermissionBroker) -> Tool:
         if not q:
             raise ValueError("需要查找关键词 | query required")
         root = broker.root
+        # 收集 (rank, depth, path)：rank 0=精确名 1=前缀 2=子串。
         hits = []
         for dirpath, dirnames, _files in os.walk(root):
             depth = dirpath[len(root):].count(os.sep)
             if depth >= _FIND_MAX_DEPTH:
                 dirnames[:] = []  # 限深，别深挖
-            dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+            # 跳过生成物/依赖目录 + 隐藏目录（.sentinel 之类是配置，不是项目）。
+            dirnames[:] = [d for d in dirnames
+                           if d not in _SKIP_DIRS and not d.startswith(".")]
             for d in dirnames:
-                if q in d.lower():
-                    hits.append(os.path.join(dirpath, d))
-            if len(hits) >= _FIND_MAX_HITS:
-                break
-        return {"query": query, "root": root, "matches": hits[:_FIND_MAX_HITS]}
+                name = d.lower()
+                if name == q:
+                    rank = 0
+                elif name.startswith(q):
+                    rank = 1
+                elif q in name:
+                    rank = 2
+                else:
+                    continue
+                hits.append((rank, depth, os.path.join(dirpath, d)))
+
+        # 有精确同名匹配时，只保留精确匹配（「sentinel-sample-app」→ 就它一个）。
+        if any(h[0] == 0 for h in hits):
+            hits = [h for h in hits if h[0] == 0]
+        hits.sort(key=lambda h: (h[0], h[1], h[2]))  # 精确>前缀>子串，再浅层优先
+        ranked = [h[2] for h in hits]
+        # 去嵌套：某匹配若在另一个匹配目录之内，丢弃深层的（保留顶层项目）。
+        kept = [p for p in ranked
+                if not any(p != k and p.startswith(k + os.sep) for k in ranked)]
+        return {"query": query, "root": root, "matches": kept[:_FIND_MAX_HITS]}
 
     return Tool("find_repo", _FIND_DESC, _find)
 
