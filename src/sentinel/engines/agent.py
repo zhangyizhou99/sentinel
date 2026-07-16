@@ -64,7 +64,11 @@ _PLAN_SYSTEM = (
     "Given a GOAL and AVAILABLE TOOLS, output ONLY a JSON list of 2-5 ordered steps, "
     'each {{"tool": "<name>", "why": "<reason>"}}. No prose.\n'
     "给定目标与可用工具，只输出 2-5 步的有序 JSON 列表，"
-    '每步 {{"tool": "<名>", "why": "<理由>"}}，不要额外文字。\n\n'
+    '每步 {{"tool": "<名>", "why": "<理由>"}}，不要额外文字。\n'
+    "If the GOAL is a conversational question answerable directly from CONTEXT "
+    "(notes / recent conversation) with NO tool, output an EMPTY list [] . | "
+    "若目标是可直接依据 CONTEXT（笔记/近期对话）回答、无需任何工具的对话式问题，"
+    "输出空列表 []。\n\n"
     "CONTEXT (recent conversation & last scan) | 会话背景（近期对话与上次扫描）:\n{context}\n\n"
     "AVAILABLE TOOLS | 可用工具:\n{tools}"
 )
@@ -179,20 +183,27 @@ class AgentCore:
             plan = json.loads(_strip_fences(raw))
             if isinstance(plan, list) and all(isinstance(s, dict) for s in plan):
                 return plan
+            if isinstance(plan, list) and not plan:
+                return []  # “无需工具，直接回答”（对话式问题）
         except (ValueError, TypeError):
             pass
-        # 兜底：一个安全的默认步（容错）。
-        first = next(iter(self.tools), "echo")
-        return [{"tool": first, "why": "fallback default step | 兜底默认步"}]
+        # 兜底：解析失败时也返回空计划而非硬塞 find_repo——
+        # 后续 act 会走“直接从 CONTEXT 回答”路径，不把对话式问题拖去扫目录。
+        return []
 
     # -- 2) ReAct -----------------------------------------------------------
 
     def act(self, run: AgentRun) -> None:
         """按计划跑 ReAct 循环；就地修改 run。手搓文本 ReAct，正则解析 Action。"""
-        plan_text = "\n".join(
-            f"{i+1}. [{s.get('tool','?')}] {s.get('why','')}"
-            for i, s in enumerate(run.plan)
-        ) or "(no plan)"
+        # 空计划 = 对话式问题直接从 CONTEXT 回答。不把 plan_text 拼成假步骤把模型带偏。
+        if run.plan:
+            plan_text = "\n".join(
+                f"{i+1}. [{s.get('tool','?')}] {s.get('why','')}"
+                for i, s in enumerate(run.plan)
+            )
+        else:
+            plan_text = ("(空计划：目标可直接依据 CONTEXT 回答，无需工具 — 请直接输出 "
+                         "Action: Finish[答案]) | (empty plan: answer from CONTEXT with Finish)")
         called: set = set()  # 去重防死循环（容错）
 
         for _ in range(self.max_act_steps):

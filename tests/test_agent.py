@@ -43,10 +43,11 @@ def test_plan_tolerates_code_fences():
 
 
 def test_plan_falls_back_on_garbage():
+    """解析失败 → 兜底为空计划（不再硬塞 find_repo），交给 act 直接依上下文回答。"""
     llm = _StubLLM(["not json"])
     core = AgentCore(llm)
     plan = core.plan("g")
-    assert plan and "tool" in plan[0]
+    assert plan == []
 
 
 # -- 2) ReAct ---------------------------------------------------------------
