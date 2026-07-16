@@ -254,69 +254,70 @@ def _format_trace(run: AgentRun) -> str:
     return "\n".join(L)
 
 
-def _judge_section(run: AgentRun):
-    """对扫出的盲区逐个跑 judge_intent，返回 (主回复建议, 轨迹④证据) 两段 markdown。
-
-    这一步把「RAG 检索 + 上下文工程 + LLM 语义判定」串起来并展示出来。
-    为控延迟/成本，最多判定 _JUDGE_CAP 个盲区。
-    """
-    _JUDGE_CAP = 5
-    reports = _scan_reports(run)
+def _judge_repo(repo: str, cap: int = 5):
+    """对一个仓库的盲区逐个跑 judge_intent（含 RAG + 上下文构建 + 压缩），返回 (主建议, 轨迹④)。"""
     main: List[str] = []
     trace: List[str] = []
-    judged = 0
-    for rep in reports:
-        repo = rep.get("repo")
-        spots = rep.get("blind_spots", [])
-        if not repo or not spots:
-            continue
-        try:
-            units = scan_repo(repo).units          # 拿到完整 CodeUnit（judge 需要 calls 等）
-        except Exception:  # noqa: BLE001
-            continue
-        by_id = {u.unit_id: u for u in units}
-        index = CodeIndex(embedder=_get_embedder())  # 建索引供 RAG 召回相似已埋点函数
-        index.index(units)
-        for b in spots:
-            if judged >= _JUDGE_CAP:
-                break
-            unit = by_id.get(f"{b.get('file')}::{b.get('function')}")
-            if unit is None:
-                continue
-            v = judge_intent(unit, index, _LLM, repo=repo,
-                             notes=_get_notes(), episodic=_get_memory())
-            judged += 1
-            sigs = ", ".join(signals_of(unit)) or "-"
+    try:
+        units = scan_repo(repo).units              # 完整 CodeUnit（judge 需要 calls 等）
+    except Exception:  # noqa: BLE001
+        return "", ""
+    by_id = {u.unit_id: u for u in units}
+    # 只对「当前算盲区」的函数判定（尊重反馈抑制）。
+    spots = [u for u in units if signals_of(u) and not u.has_instrumentation
+             and not _get_memory().is_ignored(repo, u.unit_id)]
+    if not spots:
+        return "", ""
+    index = CodeIndex(embedder=_get_embedder())    # 建索引供 RAG 召回相似已埋点函数
+    index.index(units)
+    for unit in spots[:cap]:
+        v = judge_intent(unit, index, _LLM, repo=repo,
+                         notes=_get_notes(), episodic=_get_memory())
+        sigs = ", ".join(signals_of(unit)) or "-"
 
-            # 主回复：给「该埋什么」的建议
-            verb = "建议 **埋点**" if v.verdict == "instrument" else "可跳过"
-            flag = {"uncertain": " ⚠️存疑", "llm_unavailable": " （无 LLM·通用建议）",
-                    "parse_error": " ⚠️解析失败"}.get(v.status, "")
-            main.append(f"- **`{unit.qualname}`** [{sigs}] → {verb}（置信 {v.confidence:.1f}{flag}）")
-            for s in v.suggestions[:4]:
-                main.append(f"    - {s.get('type', '?')}: {s.get('what', '')}")
-            if v.evidence:
-                main.append(f"    - 依据：{', '.join(map(str, v.evidence[:4]))}")
+        verb = "建议 **埋点**" if v.verdict == "instrument" else "可跳过"
+        flag = {"uncertain": " ⚠️存疑", "llm_unavailable": " （无 LLM·通用建议）",
+                "parse_error": " ⚠️解析失败"}.get(v.status, "")
+        main.append(f"- **`{unit.qualname}`** [{sigs}] → {verb}（置信 {v.confidence:.1f}{flag}）")
+        for s in v.suggestions[:4]:
+            main.append(f"    - {s.get('type', '?')}: {s.get('what', '')}")
+        if v.evidence:
+            main.append(f"    - 依据：{', '.join(map(str, v.evidence[:4]))}")
 
-            # 轨迹④：展示 ContextBuilder 实际拼了哪些上下文（来源/占用/是否入选）
-            kept = [c for c in v.context if c.get("included")]
-            used = sum(c.get("tokens", 0) for c in kept)
-            by_src: dict = {}
-            for c in kept:
-                by_src.setdefault(c["source"], 0)
-                by_src[c["source"]] += 1
-            comp = ", ".join(f"{k}×{n}" for k, n in by_src.items()) or "无"
-            dropped = [c for c in v.context if not c.get("included")]
-            drop_note = f"；预算外丢弃 {len(dropped)} 段" if dropped else ""
-            trace.append(
-                f"- `{unit.qualname}`：拼上下文 [{comp}] 共约 {used} tokens{drop_note}"
-                f" → 判定 **{v.verdict}** / {v.confidence:.1f}"
-            )
+        # 轨迹④：展示 ContextBuilder 实际拼了哪些上下文 + 压缩情况。
+        kept = [c for c in v.context if c.get("included")]
+        used = sum(c.get("tokens", 0) for c in kept)
+        by_src: dict = {}
+        for c in kept:
+            by_src[c["source"]] = by_src.get(c["source"], 0) + 1
+        comp = ", ".join(f"{k}×{n}" for k, n in by_src.items()) or "无"
+        shrunk = [c for c in kept if c.get("level") in ("compact", "clipped", "summarized")]
+        dropped = [c for c in v.context if not c.get("included")]
+        notes = []
+        if shrunk:
+            notes.append(f"压缩 {len(shrunk)} 段（{', '.join(sorted({c['level'] for c in shrunk}))}）")
+        if dropped:
+            notes.append(f"预算外丢弃 {len(dropped)} 段")
+        tail = ("；" + "；".join(notes)) if notes else ""
+        trace.append(
+            f"- `{unit.qualname}`：拼上下文 [{comp}] 共约 {used} tokens{tail}"
+            f" → 判定 **{v.verdict}** / {v.confidence:.1f}"
+        )
 
     main_md = ("### 🧠 意图判定（该埋什么）\n" + "\n".join(main)) if main else ""
-    trace_md = ("**④ 上下文构建 + Judge**（多源证据 → 预算取舍 → LLM 判定）\n"
+    trace_md = ("**④ 上下文构建 + 压缩 + Judge**（多源证据 → 去重/降级/预算 → LLM 判定）\n"
                 + "\n".join(trace)) if trace else ""
     return main_md, trace_md
+
+
+def _judge_section(run: AgentRun):
+    """对一次 run 里扫到的仓库跑判定（取第一个有盲区的仓库），返回 (主建议, 轨迹④)。"""
+    for rep in _scan_reports(run):
+        repo = rep.get("repo")
+        if repo and rep.get("blind_spots"):
+            return _judge_repo(repo)
+    return "", ""
+
 
 
 def _format_run(run: AgentRun) -> str:
@@ -352,6 +353,19 @@ def _format_run(run: AgentRun) -> str:
     return "\n".join(parts)
 
 
+def _report_with_judge(report: dict, repo: str) -> str:
+    """扫描报告 → 表格 + 意图判定 + 可展开的「上下文构建/压缩」轨迹（有 LLM 才判定）。"""
+    out = _render_report(report)
+    if _LLM.available:
+        main, trace = _judge_repo(repo)
+        if main:
+            out += "\n\n" + main
+        if trace:
+            out += ("\n\n<details><summary>🔎 上下文构建 + 压缩 + 判定（点击展开）</summary>"
+                    f"\n\n{trace}\n</details>")
+    return out
+
+
 def _format_scan_result(path: str) -> str:
     """降级模式：不经 LLM，直接扫描并渲染盲区表（文件名可点击跳 VS Code）。
 
@@ -359,7 +373,7 @@ def _format_scan_result(path: str) -> str:
     """
     report = build_scan_tool(broker=None, memory=_get_memory()).func(path)
     if isinstance(report, dict) and "blind_spots" in report:
-        return _render_report(report)
+        return _report_with_judge(report, path)
     return f"扫描 `{path}` 未返回结果。"
 
 
@@ -529,6 +543,14 @@ def _controls(pending=None, candidates=None):
     return radio, gr.update(visible=show), gr.update(visible=show)
 
 
+def _ignore_controls(state):
+    """返回「忽略」下拉与按钮的更新：有上次扫描盲区时才显示，选项=各盲区 unit_id。"""
+    spots = (state.get("last_scan") or {}).get("spots", [])
+    choices = [s["unit_id"] for s in spots]
+    vis = bool(choices)
+    return gr.update(visible=vis, choices=choices, value=[]), gr.update(visible=vis)
+
+
 def _stash_scan(state: dict, report) -> None:
     """把一次扫描的盲区快照存进会话态，供下一轮解析「把这个忽略」这类指代。"""
     if not isinstance(report, dict) or "blind_spots" not in report:
@@ -621,8 +643,8 @@ def _approve(state: dict, selected: Optional[str]):
     _authorize_open(target)  # 授权成功 → 其下文件今后可被 /open 打开
     report = build_scan_tool(broker, memory=_get_memory()).func(target)
     if isinstance(report, dict) and "blind_spots" in report:
-        _stash_scan(state, report)                        # 存盲区快照，供下一轮指代
-        return _render_report(report)
+        _stash_scan(state, report)                        # 存盲区快照，供下一轮指代 + 忽略按钮
+        return _report_with_judge(report, target)
     return _format_scan_result(target)  # 兜底
 
 
@@ -640,7 +662,8 @@ def _ui_bot(chat, state):
     state = _ensure(state)
     chat = list(chat or [])
     if not chat or chat[-1].get("role") != "user":
-        return chat, *_controls(state.get("pending"), state.get("candidates"))
+        return chat, *_controls(state.get("pending"), state.get("candidates")), \
+            *_ignore_controls(state)
     msg = chat[-1]["content"]
 
     # 有待授权时，也支持打字「同意/取消」（与按钮等效）。
@@ -659,7 +682,7 @@ def _ui_bot(chat, state):
         state["candidates"] = candidates
 
     chat.append({"role": "assistant", "content": reply})
-    return chat, *_controls(pending, candidates)
+    return chat, *_controls(pending, candidates), *_ignore_controls(state)
 
 
 def _ui_approve(chat, state, selected):
@@ -668,7 +691,7 @@ def _ui_approve(chat, state, selected):
     reply = _approve(state, selected)
     chat.append({"role": "user", "content": f"✅ 同意扫描 `{selected or (state.get('goal') or '')}`"})
     chat.append({"role": "assistant", "content": reply})
-    return chat, *_controls([], [])
+    return chat, *_controls([], []), *_ignore_controls(state)
 
 
 def _ui_deny(chat, state):
@@ -678,7 +701,28 @@ def _ui_deny(chat, state):
     state["candidates"] = []
     chat.append({"role": "user", "content": "❌ 取消"})
     chat.append({"role": "assistant", "content": "好的，已取消，不读取该目录。"})
-    return chat, *_controls([], [])
+    return chat, *_controls([], []), *_ignore_controls(state)
+
+
+def _ui_ignore(chat, state, selected):
+    """把选中的盲区函数标记为「不用埋点」（写入反馈记忆），下次扫描自动抑制。"""
+    from sentinel.memory import IGNORE
+    state = _ensure(state)
+    chat = list(chat or [])
+    last = state.get("last_scan") or {}
+    repo = last.get("repo")
+    picks = list(selected or [])
+    if repo and picks:
+        mem = _get_memory()
+        for uid in picks:
+            mem.record_feedback(repo, uid, IGNORE)
+        last["spots"] = [s for s in last.get("spots", []) if s["unit_id"] not in set(picks)]
+        state["last_scan"] = last
+        names = "、".join(f"`{u}`" for u in picks)
+        chat.append({"role": "user", "content": f"🚫 忽略 {len(picks)} 个函数"})
+        chat.append({"role": "assistant",
+                     "content": f"已把 {names} 标记为「不用埋点」，下次扫描将自动抑制（反馈学习）。"})
+    return chat, *_controls([], []), *_ignore_controls(state)
 
 
 def build_demo() -> "gr.Blocks":
@@ -700,10 +744,14 @@ def build_demo() -> "gr.Blocks":
             approve_btn = gr.Button("✅ 同意扫描", variant="primary", visible=False)
             deny_btn = gr.Button("❌ 取消", visible=False)
         with gr.Row():
+            ignore_dd = gr.Dropdown(choices=[], value=[], multiselect=True, visible=False,
+                                    scale=8, label="🚫 选不用埋点的函数（忽略后下次扫描不再报）")
+            ignore_btn = gr.Button("🚫 忽略选中", visible=False, scale=1)
+        with gr.Row():
             msg = gr.Textbox(placeholder="扫一下 sentinel-sample-app", show_label=False, scale=8, autofocus=True)
             send = gr.Button("发送", variant="primary", scale=1)
 
-        outs_btn = [chatbot, cand_radio, approve_btn, deny_btn]
+        outs_btn = [chatbot, cand_radio, approve_btn, deny_btn, ignore_dd, ignore_btn]
         # 两步：先秒回显示用户消息+清空输入框，再 .then() 跑 agent 补回复。
         add_io = ([msg, chatbot], [chatbot, msg])
         send.click(_ui_add_user, *add_io, api_name=False).then(
@@ -713,6 +761,7 @@ def build_demo() -> "gr.Blocks":
 
         approve_btn.click(_ui_approve, [chatbot, state, cand_radio], outs_btn, api_name=False)
         deny_btn.click(_ui_deny, [chatbot, state], outs_btn, api_name=False)
+        ignore_btn.click(_ui_ignore, [chatbot, state, ignore_dd], outs_btn, api_name=False)
 
     return demo
 

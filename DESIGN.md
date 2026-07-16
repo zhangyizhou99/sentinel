@@ -247,7 +247,8 @@ flowchart LR
 - **可插拔证据源** `EvidenceProvider`：每个源产出若干带**优先级 + 溯源引用**的 `ContextSection`。内置 5 个（优先级从高到低）：
   `TargetProvider`(函数本身，必留) > `HistoryProvider`(该函数历史反馈=强先验) > `NoteProvider`(相关团队笔记) > `PeerProvider`(RAG 召回已埋点相似函数) > `KnowledgeProvider`(RED/USE)。加一路证据 = 加一个 provider。
 - **token 预算**：`ContextBuilder(providers, token_budget)` 按优先级贪心取舍；**待判定函数必留**（没有它无法判），其余超预算的记入 `dropped`。大仓不撑爆上下文。
-- **溯源**：`BuiltContext.sections/dropped` 记录每段的来源/引用/token/是否入选；`Verdict.context` 带出，界面可展开看「拼了哪些上下文、各占多少预算、丢了啥」。判定引用 `note:<id>`/`knowledge:<信号>`/`feedback:<裁决>`/peer unit_id（接地防幻觉 §7.3）。
+- **上下文压缩**（确定性优先）：超预算不整段硬删，而是**分级降级**——每个 `ContextSection` 带 `compact`（精简版），塞不下时 full→compact→截断（`clipped`）逐级缩，都塞不下才 drop；构建前先**去重**（同来源同引用 / 同内容只留一条）。另留**可选 LLM 摘要钩子** `compressor(text, target_tokens)`（默认关，保持 air-gapped/确定性；摘要优先于暴力截断，失败自动回退截断）。`level` 字段记录每段最终形态（full/compact/clipped/summarized/dropped）。
+- **溯源**：`BuiltContext.sections/dropped` 记录每段的来源/引用/token/是否入选；`Verdict.context` 带出，界面可展开看「拼了哪些上下文、各占多少预算、压缩/丢弃了啥」。判定引用 `note:<id>`/`knowledge:<信号>`/`feedback:<裁决>`/peer unit_id（接地防幻觉 §7.3）。
 - **笔记闭环**：`memory/notes.py` `NoteStore`（SQLite，作用域 unit>repo>global + 标签）。Agent/用户用 `add_note`/`recall_notes` 记团队约定，`NoteProvider` 判定时自动召回注入——**Sentinel 越用越懂这个团队的规矩**。
 - **容错**：任一 provider 抛错只跳过该源，不拖垮整体（§13）。
 

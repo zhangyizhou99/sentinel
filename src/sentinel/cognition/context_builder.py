@@ -59,19 +59,27 @@ class ContextTarget:
 
 @dataclass
 class ContextSection:
-    """一条上下文片段：带来源、优先级、溯源引用与 token 估算。"""
+    """一条上下文片段：带来源、优先级、溯源引用与 token 估算。
+
+    压缩支持：`compact` 是本段的**精简版**（provider 可选提供）；预算不够时构建器会
+    先降级到 compact、再截断，最后才丢弃（graceful degradation，而非整段硬删）。
+    `level` 记录最终落地的形态：full / compact / clipped / dropped。
+    """
     source: str                 # target|history|note|peer|knowledge
     title: str                  # 人读小标题
     content: str                # 正文（会进 prompt）
     priority: int               # 越大越优先保留
     ref: str = ""               # 溯源引用：unit_id / note:<id> / knowledge:<signal>
+    compact: str = ""           # 精简版正文（可选；空则截断 content 兜底）
+    min_chars: int = 40         # 截断下限：低于此就不值得留，直接丢
     tokens: int = 0             # 估算 token（build 时填）
     included: bool = True       # 是否入选（未入选=被预算丢弃）
+    level: str = "full"         # full | compact | clipped | dropped
 
     def to_dict(self) -> dict:
         return {"source": self.source, "title": self.title, "ref": self.ref,
                 "tokens": self.tokens, "included": self.included,
-                "priority": self.priority}
+                "priority": self.priority, "level": self.level}
 
 
 @dataclass
@@ -99,11 +107,20 @@ class EvidenceProvider:
 
 
 class ContextBuilder:
-    """按优先级 + token 预算，把多路证据拼成一份上下文。"""
+    """按优先级 + token 预算，把多路证据拼成一份上下文（含压缩）。
 
-    def __init__(self, providers: List[EvidenceProvider], token_budget: int = 1200):
+    压缩策略（确定性优先，无 LLM）：
+      1. 去重：同来源同引用 / 完全相同内容的片段只留一条。
+      2. 分级降级：超预算时**先降到 compact、再截断，最后才丢弃**（不整段硬删）。
+      3. 可选 LLM 压缩钩子 `compressor(text, target_tokens) -> text`：给超长片段做摘要；
+         默认 None（保持 air-gapped / 确定性），失败自动回退到截断。
+    """
+
+    def __init__(self, providers: List[EvidenceProvider], token_budget: int = 1200,
+                 compressor=None):
         self.providers = providers
         self.token_budget = token_budget
+        self.compressor = compressor  # 可选：callable(text, target_tokens)->text
 
     def build(self, target: ContextTarget) -> BuiltContext:
         sections: List[ContextSection] = []
@@ -118,27 +135,79 @@ class ContextBuilder:
         # 稳定按优先级降序取舍（同优先级保持加入顺序）。
         order = {id(s): i for i, s in enumerate(sections)}
         sections.sort(key=lambda s: (-s.priority, order[id(s)]))
+        sections = self._dedup(sections)
 
         kept: List[ContextSection] = []
         dropped: List[ContextSection] = []
         used = 0
         for i, s in enumerate(sections):
-            # 最高优先级片段（待判定函数本身）必留，即使单条就超预算——没有它无法判定。
-            if i == 0:
-                s.included = True
-                used += s.tokens
-                kept.append(s)
-                continue
-            if used + s.tokens <= self.token_budget:
-                s.included = True
-                used += s.tokens
-                kept.append(s)
-            else:
+            remaining = self.token_budget - used
+            fit = self._fit(s, remaining, mandatory=(i == 0))
+            if fit is None:
                 s.included = False
+                s.level = "dropped"
                 dropped.append(s)
+                continue
+            s.content, s.level, s.tokens = fit
+            s.included = True
+            used += s.tokens
+            kept.append(s)
 
         text = self._render(kept)
         return BuiltContext(kept, dropped, text, used, self.token_budget)
+
+    @staticmethod
+    def _dedup(sections: List[ContextSection]) -> List[ContextSection]:
+        """去重：同 (来源, 引用) 或完全相同正文的片段只留优先级最高的那条。"""
+        seen_ref = set()
+        seen_content = set()
+        out: List[ContextSection] = []
+        for s in sections:
+            ref_key = (s.source, s.ref) if s.ref else None
+            if ref_key and ref_key in seen_ref:
+                continue
+            if s.content in seen_content:
+                continue
+            if ref_key:
+                seen_ref.add(ref_key)
+            seen_content.add(s.content)
+            out.append(s)
+        return out
+
+    def _fit(self, s: ContextSection, remaining: int, mandatory: bool):
+        """把片段塞进剩余预算：full → compact → (可选 LLM 摘要) → 截断 → 放不下则 None。
+
+        mandatory=True（待判定函数）：即使超预算也必须返回一个形态（宁可超也要留）。
+        返回 (content, level, tokens) 或 None。
+        """
+        full_tok = estimate_tokens(s.content)
+        if full_tok <= remaining:
+            return s.content, "full", full_tok
+        # 降级到精简版
+        if s.compact:
+            ctok = estimate_tokens(s.compact)
+            if ctok <= remaining:
+                return s.compact, "compact", ctok
+        base = s.compact or s.content
+        # 还要更小：优先用 LLM 摘要（信息量高于暴力截断），失败/无则截断。
+        if self.compressor is not None and remaining > 0:
+            try:
+                summ = self.compressor(base, remaining)
+                if summ:
+                    if estimate_tokens(summ) > remaining:
+                        summ = summ[: remaining * 4 - 1].rstrip() + "…"
+                    return summ, "summarized", estimate_tokens(summ)
+            except Exception:  # noqa: BLE001  压缩失败 → 回退到截断
+                pass
+        # 截断到剩余预算（约 remaining*4 字符），但不低于 min_chars 才值得留
+        if remaining * 4 >= s.min_chars:
+            clipped = base[: remaining * 4 - 1].rstrip() + "…"
+            return clipped, "clipped", estimate_tokens(clipped)
+        if mandatory:
+            # 必留：放精简版或原文（可超预算，因为没有它无法判定）
+            return (s.compact or s.content), ("compact" if s.compact else "full"), \
+                   estimate_tokens(s.compact or s.content)
+        return None
 
     def _render(self, kept: List[ContextSection]) -> str:
         """按逻辑分组顺序渲染入选片段（不是按优先级），便于模型阅读。"""
@@ -179,8 +248,14 @@ class TargetProvider(EvidenceProvider):
             f"dependency signals: {', '.join(target.signals) or '(none)'}\n"
             f"has_instrumentation: {u.has_instrumentation}"
         )
+        # 精简版：只留判定最关键的三行（签名/调用/信号），丢 docstring 与已埋点行。
+        compact = (
+            f"unit_id: {u.unit_id}\n"
+            f"signature: {u.qualname}{u.signature}\n"
+            f"calls: {', '.join(u.calls) or '(none)'} | signals: {', '.join(target.signals) or '(none)'}"
+        )
         return [ContextSection(SRC_TARGET, "target", content, priority=100,
-                               ref=u.unit_id)]
+                               ref=u.unit_id, compact=compact)]
 
 
 class HistoryProvider(EvidenceProvider):
@@ -200,8 +275,9 @@ class HistoryProvider(EvidenceProvider):
         zh = {"ignore": "不需要埋点", "instrument": "需要埋点"}.get(latest.decision, latest.decision)
         content = f"- 用户此前将该函数标记为「{zh}」({latest.decision})" + (
             f"，备注：{_trunc(latest.note)}" if latest.note else "")
+        compact = f"- 历史裁决：{latest.decision}"
         return [ContextSection(SRC_HISTORY, "prior feedback", content, priority=92,
-                               ref=f"feedback:{latest.decision}")]
+                               ref=f"feedback:{latest.decision}", compact=compact)]
 
 
 class NoteProvider(EvidenceProvider):
@@ -225,8 +301,9 @@ class NoteProvider(EvidenceProvider):
             pri = {"unit": 95, "repo": 78, "global": 64}.get(n.scope, 64)
             tag = f" [{', '.join(n.tags)}]" if n.tags else ""
             content = f"- ({n.scope}{tag}) {_trunc(n.text, 200)}"
+            compact = f"- ({n.scope}) {_trunc(n.text, 80)}"
             out.append(ContextSection(SRC_NOTE, f"note#{n.id}", content,
-                                      priority=pri, ref=f"note:{n.id}"))
+                                      priority=pri, ref=f"note:{n.id}", compact=compact))
         return out
 
 
@@ -252,8 +329,10 @@ class PeerProvider(EvidenceProvider):
             p = h.payload
             content = (f"- {p.get('unit_id')} | calls: "
                        f"{', '.join(p.get('calls', [])) or '(none)'}")
+            compact = f"- {p.get('unit_id')}"
             out.append(ContextSection(SRC_PEER, p.get("qualname", "peer"), content,
-                                      priority=70 - rank, ref=str(p.get("unit_id", ""))))
+                                      priority=70 - rank, ref=str(p.get("unit_id", "")),
+                                      compact=compact))
         return out
 
 
@@ -267,7 +346,7 @@ class KnowledgeProvider(EvidenceProvider):
         for sig, obs in know.items():
             content = f"- knowledge:{sig} → {', '.join(obs)}"
             out.append(ContextSection(SRC_KNOWLEDGE, sig, content, priority=55,
-                                      ref=f"knowledge:{sig}"))
+                                      ref=f"knowledge:{sig}", compact=f"- knowledge:{sig}"))
         return out
 
 
