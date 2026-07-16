@@ -269,3 +269,57 @@ def build_feedback_tool(memory) -> Tool:
                 "note": "已记录：下次扫描将抑制该函数 | recorded; suppressed on next scan"}
 
     return Tool("ignore_finding", _IGNORE_DESC, _ignore)
+
+
+# ---- add_note / recall_notes：团队笔记（喂给 ContextBuilder 的一等证据）--------
+
+_ADD_NOTE_DESC = (
+    "add_note(内容) — 记下一条关于当前仓库的团队笔记/约定（如「所有外部 HTTP 调用都要打"
+    "延迟直方图」「settings.py 里的读取无需埋点」）。笔记会持久保存，并在之后判定该仓库的"
+    "函数时被自动召回、纳入上下文——让 Sentinel 越用越懂这个团队的规矩。"
+    "输入：笔记正文；归属最近一次扫描的仓库。 | "
+    "add_note(text) — Record a team note/convention about the current repo. It is persisted and "
+    "auto-recalled into the judgement context for this repo's functions later. Input: the note "
+    "text; scoped to the most recently scanned repo."
+)
+
+_RECALL_NOTES_DESC = (
+    "recall_notes(关键词) — 查一下当前仓库有哪些相关团队笔记/约定。输入：关键词（可留空看最近的）。"
+    "用于判定前先了解团队既有规矩，避免给出与约定冲突的建议。 | "
+    "recall_notes(query) — Look up relevant team notes/conventions for the current repo. Input: "
+    "a keyword (may be empty for recent ones). Use it to align with existing conventions."
+)
+
+
+def build_note_tool(notes, memory) -> Tool:
+    """构造 add_note 工具：把笔记绑到 memory.last_repo（最近扫过的仓库）。"""
+    def _add(text: str) -> Dict[str, Any]:
+        body = _clean(text)
+        if not body:
+            raise ValueError("需要笔记内容 | note text required")
+        repo = getattr(memory, "last_repo", None)  # 没扫过则记为全局笔记
+        note_id = notes.add_note(body, repo=repo, author="user")
+        scope = "仓库" if repo else "全局"
+        return {"ok": True, "note_id": note_id, "scope": scope, "repo": repo or "(global)",
+                "note": "已记录，之后判定该仓库函数时会自动纳入上下文 | recorded; "
+                        "will be recalled into context"}
+
+    return Tool("add_note", _ADD_NOTE_DESC, _add)
+
+
+def build_recall_notes_tool(notes, memory) -> Tool:
+    """构造 recall_notes 工具：按当前仓库 + 关键词召回笔记。"""
+    def _recall(query: str) -> Dict[str, Any]:
+        repo = getattr(memory, "last_repo", None)
+        hits = notes.search_notes(repo=repo, query=_clean(query), limit=8)
+        return {
+            "repo": repo or "(global)",
+            "count": len(hits),
+            "notes": [
+                {"id": sn.note.id, "scope": sn.note.scope, "tags": sn.note.tags,
+                 "text": sn.note.text}
+                for sn in hits
+            ],
+        }
+
+    return Tool("recall_notes", _RECALL_NOTES_DESC, _recall)

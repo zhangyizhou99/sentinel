@@ -6,3 +6,11 @@ from sentinel.memory.episodic import (  # noqa: F401
     IGNORE,
     INSTRUMENT,
 )
+from sentinel.memory.notes import (  # noqa: F401
+    NoteStore,
+    Note,
+    ScoredNote,
+    GLOBAL,
+    REPO,
+    UNIT,
+)

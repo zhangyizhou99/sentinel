@@ -43,10 +43,11 @@ from sentinel.engines.agent_tools import (
     build_check_language_tool,
     build_install_language_tool,
     build_feedback_tool,
+    build_note_tool,
+    build_recall_notes_tool,
 )
 from sentinel.engines.scan import scan_repo, signals_of
-from sentinel.engines.judge import judge_intent, _peers
-from sentinel.engines.knowledge import knowledge_for
+from sentinel.engines.judge import judge_intent
 from sentinel.cognition import CodeIndex
 from sentinel.llm import LLMClient
 from sentinel.permissions import PermissionBroker
@@ -64,6 +65,17 @@ def _get_memory():
         from sentinel.memory import EpisodicMemory
         _MEMORY = EpisodicMemory()
     return _MEMORY
+
+# 笔记库单例（团队笔记 → 判定上下文的一等证据）。
+_NOTES = None
+
+
+def _get_notes():
+    global _NOTES
+    if _NOTES is None:
+        from sentinel.memory import NoteStore
+        _NOTES = NoteStore()
+    return _NOTES
 
 # 意图判定用的向量索引 embedder 单例（避免每条消息重载模型）。
 _EMBEDDER = None
@@ -91,14 +103,17 @@ def _is_open_authorized(ap: str) -> bool:
 
 
 def _build_agent(broker: PermissionBroker) -> AgentCore:
-    """构造带 find_repo + scan + 语言检测/补齐 + 反馈 五个工具的 agent（均受该会话权限门约束）。"""
+    """构造 agent 工具集：查找/扫描/语言检测·补齐/反馈/笔记（均受该会话权限门约束）。"""
     mem = _get_memory()
+    notes = _get_notes()
     find = build_find_repo_tool(broker)
     scan = build_scan_tool(broker, memory=mem)            # 带记忆：抑制被拒的 + 记录运行
     check = build_check_language_tool(broker)             # 只读：报告语言覆盖缺口
     install = build_install_language_tool(_LLM)           # 破坏性：须用户明确同意后才补齐
     ignore = build_feedback_tool(mem)                     # 反馈学习：标为不用埋点→下次抑制
-    tools = {t.name: t for t in (find, scan, check, install, ignore)}
+    add_note = build_note_tool(notes, mem)               # 记团队笔记 → 判定上下文一等证据
+    recall = build_recall_notes_tool(notes, mem)         # 查团队笔记
+    tools = {t.name: t for t in (find, scan, check, install, ignore, add_note, recall)}
     return AgentCore(_LLM, tools=tools)
 
 
@@ -268,7 +283,8 @@ def _judge_section(run: AgentRun):
             unit = by_id.get(f"{b.get('file')}::{b.get('function')}")
             if unit is None:
                 continue
-            v = judge_intent(unit, index, _LLM)
+            v = judge_intent(unit, index, _LLM, repo=repo,
+                             notes=_get_notes(), episodic=_get_memory())
             judged += 1
             sigs = ", ".join(signals_of(unit)) or "-"
 
@@ -282,17 +298,23 @@ def _judge_section(run: AgentRun):
             if v.evidence:
                 main.append(f"    - 依据：{', '.join(map(str, v.evidence[:4]))}")
 
-            # 轨迹④：展示 RAG 召回了哪些证据
-            peers = _peers(unit, index)
-            peer_names = ", ".join(p.get("qualname", "?") for p in peers) or "无"
-            know = ", ".join(knowledge_for(signals_of(unit)).keys()) or "无"
+            # 轨迹④：展示 ContextBuilder 实际拼了哪些上下文（来源/占用/是否入选）
+            kept = [c for c in v.context if c.get("included")]
+            used = sum(c.get("tokens", 0) for c in kept)
+            by_src: dict = {}
+            for c in kept:
+                by_src.setdefault(c["source"], 0)
+                by_src[c["source"]] += 1
+            comp = ", ".join(f"{k}×{n}" for k, n in by_src.items()) or "无"
+            dropped = [c for c in v.context if not c.get("included")]
+            drop_note = f"；预算外丢弃 {len(dropped)} 段" if dropped else ""
             trace.append(
-                f"- `{unit.qualname}`：RAG 召回 **{len(peers)}** 个已埋点相似函数（{peer_names}）"
-                f"；RED/USE 知识：{know} → 判定 **{v.verdict}** / {v.confidence:.1f}"
+                f"- `{unit.qualname}`：拼上下文 [{comp}] 共约 {used} tokens{drop_note}"
+                f" → 判定 **{v.verdict}** / {v.confidence:.1f}"
             )
 
     main_md = ("### 🧠 意图判定（该埋什么）\n" + "\n".join(main)) if main else ""
-    trace_md = ("**④ RAG + Judge · 意图判定**（检索证据 → 拼上下文 → LLM 判定）\n"
+    trace_md = ("**④ 上下文构建 + Judge**（多源证据 → 预算取舍 → LLM 判定）\n"
                 + "\n".join(trace)) if trace else ""
     return main_md, trace_md
 

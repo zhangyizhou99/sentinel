@@ -5,9 +5,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from sentinel.model.code_unit import CodeUnit  # noqa: E402
-from sentinel.engines.judge import judge_intent, _peers  # noqa: E402
+from sentinel.engines.judge import judge_intent  # noqa: E402
 from sentinel.engines.knowledge import knowledge_for  # noqa: E402
 from sentinel.cognition import CodeIndex, HashEmbedder, MemoryStore  # noqa: E402
+from sentinel.cognition.context_builder import PeerProvider, ContextTarget  # noqa: E402
 
 
 class StubLLM:
@@ -71,7 +72,8 @@ def test_peers_only_instrumented_and_not_self():
     peer_ok = _unit("get_cached_user", ["redis.get"], instrumented=True, doc="read user cache")
     peer_no = _unit("compute_total", ["redis.get"], instrumented=False, doc="sum cache")
     idx.index([_BLIND, peer_ok, peer_no])
-    got = {p["unit_id"] for p in _peers(_BLIND, idx)}
+    sections = PeerProvider(idx).provide(ContextTarget(unit=_BLIND, signals=["cache", "http"]))
+    got = {s.ref for s in sections}
     assert "app.py::get_cached_user" in got           # 已埋点的相似函数
     assert "app.py::compute_total" not in got         # 未埋点的排除
     assert "app.py::create_order" not in got          # 自己排除

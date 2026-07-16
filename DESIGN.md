@@ -203,6 +203,8 @@ VectorStore(port)  ← 上层只认接口
 | `deploy_alerts` | 告警 policy → **推 Grafana**（联络点/路由） | **是** | — |
 | `blame_route` | 代码单元 → 作者/通知目标（git blame） | 否 | 6 |
 | `ignore_finding` | unit_id → 标为「不用埋点」，下次 scan 自动抑制（反馈学习·已落地） | 否 | 11 |
+| `add_note` | 文本 → 记团队笔记/约定（判定上下文一等证据·已落地） | 否 | 9 |
+| `recall_notes` | 关键词 → 召回当前仓库相关笔记（已落地） | 否 | 9 |
 | `evaluate` | fixtures → P/R/F1 | 否 | 12 |
 
 > **一键告警 / 一键看板** = `gen_alert` + `deploy_alerts`（或 `gen_dashboard` + `deploy_dashboard`）的组合，由编排层串起来；两个 deploy 均为**破坏性**，必过人审门。这套 legacy 已跑通（Grafana Provisioning API + OTLP→Grafana→Slack 真实闭环），新项目复用其逻辑但按本文档重构。
@@ -237,6 +239,17 @@ flowchart LR
 3. **业务意图上下文**：周边模块、docstring、commit message（读懂「别人的意图」）。
 
 > 代码体现：`judge_intent` 返回 `{verdict, confidence, evidence:[{unit_id, why}], citations}`，**无证据不下结论**。
+
+#### 7.1.1 已落地：ContextBuilder（可插拔证据源 + token 预算 + 溯源）
+
+证据拼装从 `judge_intent` 里那段写死的三段升级为一个正经的构建器（`cognition/context_builder.py`）：
+
+- **可插拔证据源** `EvidenceProvider`：每个源产出若干带**优先级 + 溯源引用**的 `ContextSection`。内置 5 个（优先级从高到低）：
+  `TargetProvider`(函数本身，必留) > `HistoryProvider`(该函数历史反馈=强先验) > `NoteProvider`(相关团队笔记) > `PeerProvider`(RAG 召回已埋点相似函数) > `KnowledgeProvider`(RED/USE)。加一路证据 = 加一个 provider。
+- **token 预算**：`ContextBuilder(providers, token_budget)` 按优先级贪心取舍；**待判定函数必留**（没有它无法判），其余超预算的记入 `dropped`。大仓不撑爆上下文。
+- **溯源**：`BuiltContext.sections/dropped` 记录每段的来源/引用/token/是否入选；`Verdict.context` 带出，界面可展开看「拼了哪些上下文、各占多少预算、丢了啥」。判定引用 `note:<id>`/`knowledge:<信号>`/`feedback:<裁决>`/peer unit_id（接地防幻觉 §7.3）。
+- **笔记闭环**：`memory/notes.py` `NoteStore`（SQLite，作用域 unit>repo>global + 标签）。Agent/用户用 `add_note`/`recall_notes` 记团队约定，`NoteProvider` 判定时自动召回注入——**Sentinel 越用越懂这个团队的规矩**。
+- **容错**：任一 provider 抛错只跳过该源，不拖垮整体（§13）。
 
 ### 7.2 召回率怎么看（评估，第12章）
 - `eval/fixtures/*`：标注好「理想应监控的指标」的样例仓库 + `expected.json`。
