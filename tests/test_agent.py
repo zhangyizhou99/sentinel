@@ -183,3 +183,22 @@ def test_context_flows_into_plan_and_act():
     assert "app.py::get_user" in seen.get("plan", "")
     assert "app.py::get_user" in seen.get("act", "")
 
+
+def test_act_salvages_conversational_reply():
+    """模型没给 Action、只是自然语言回答（如「你是谁」）→ 用它的话当答案，不报「无法解析动作」。"""
+    class Conv:
+        available = True
+
+        def complete(self, system, user):
+            if "规划器" in system:
+                return "[]"                                   # 无需工具
+            if "执行器" in system:
+                return "你是 jiojio，本项目的主要负责人。"      # 直接对话回答，无 Action
+            return '{"score": 9, "complete": true, "missing": [], "next": ""}'
+
+    core = AgentCore(Conv())
+    run = core.run("还记得我是谁吗", context="[NOTES] (global) 我是主要负责人jiojio")
+    assert "jiojio" in run.answer
+    assert "无法解析动作" not in run.answer
+
+

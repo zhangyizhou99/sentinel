@@ -78,7 +78,11 @@ _ACT_SYSTEM = (
     "You are Sentinel's executor using the ReAct pattern / 你是 Sentinel 的执行器（ReAct）。\n"
     "Reply with EXACTLY one step:\n"
     "Thought: <your reasoning | 你的推理>\n"
-    "Action: <tool_name>[<input>]   (use a real tool, or Finish[<answer>] when done)\n\n"
+    "Action: <tool_name>[<input>]   (use a real tool, or Finish[<answer>] when done)\n"
+    "If the GOAL can be answered directly from CONTEXT (notes / recent conversation) WITHOUT any "
+    "tool, output Action: Finish[answer] immediately and ignore the plan. | "
+    "若目标能直接依据 CONTEXT（笔记 / 近期对话）回答、无需任何工具，"
+    "立刻输出 Action: Finish[答案]，忽略计划。\n\n"
     "AVAILABLE TOOLS | 可用工具:\n{tools}\n\n"
     "GOAL | 目标:\n{goal}\n\n"
     "CONTEXT (recent conversation & last scan) | 会话背景（近期对话与上次扫描）:\n{context}\n\n"
@@ -132,6 +136,20 @@ def _strip_fences(text: str) -> str:
         if t[:4].lower() == "json":
             t = t[4:].strip()
     return t
+
+
+def _strip_speaker(text: str) -> str:
+    """从模型的自由回复里剥掉 Thought:/Action: 前缀，取自然语言正文（对话式回答兜底用）。"""
+    t = _strip_fences((text or "").strip())
+    out: List[str] = []
+    for ln in t.splitlines():
+        s = ln.strip()
+        if re.match(r"(?i)^\s*action\s*[:：]", s):
+            continue
+        s = re.sub(r"(?i)^\s*(thought|想)\s*[:：]\s*", "", s)
+        if s:
+            out.append(s)
+    return " ".join(out).strip()
 
 
 class AgentCore:
@@ -188,7 +206,12 @@ class AgentCore:
                 run.transcript.append({"type": "thought", "content": thought})
 
             if action is None:
-                run.answer = run.answer or "（无法解析动作 | no action parsed）"
+                # 没有可执行动作：多半是模型在**直接对话回答**（如「你是谁」——答案就在 CONTEXT
+                # 的笔记/对话里，无需工具）。把它说的话当答案，而不是报「无法解析动作」。
+                reply = (thought or _strip_speaker(text)).strip()
+                run.answer = run.answer or reply or "（无法解析动作 | no action parsed）"
+                if reply:
+                    run.transcript.append({"type": "finish", "content": reply})
                 return
 
             name, arg = action
