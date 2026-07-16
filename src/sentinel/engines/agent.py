@@ -65,6 +65,7 @@ _PLAN_SYSTEM = (
     'each {{"tool": "<name>", "why": "<reason>"}}. No prose.\n'
     "给定目标与可用工具，只输出 2-5 步的有序 JSON 列表，"
     '每步 {{"tool": "<名>", "why": "<理由>"}}，不要额外文字。\n\n'
+    "CONTEXT (recent conversation & last scan) | 会话背景（近期对话与上次扫描）:\n{context}\n\n"
     "AVAILABLE TOOLS | 可用工具:\n{tools}"
 )
 
@@ -80,6 +81,7 @@ _ACT_SYSTEM = (
     "Action: <tool_name>[<input>]   (use a real tool, or Finish[<answer>] when done)\n\n"
     "AVAILABLE TOOLS | 可用工具:\n{tools}\n\n"
     "GOAL | 目标:\n{goal}\n\n"
+    "CONTEXT (recent conversation & last scan) | 会话背景（近期对话与上次扫描）:\n{context}\n\n"
     "PLAN | 计划:\n{plan}\n\n"
     "HISTORY | 历史:\n{history}"
 )
@@ -109,6 +111,7 @@ class AgentRun:
     failures: List[Dict[str, Any]] = field(default_factory=list)  # 容错：记录所有失败（DESIGN §13）
     answer: str = ""
     rounds: int = 0
+    context: str = ""  # 会话背景（近期对话 + 上次扫描），让多轮指代能解析
 
     def to_dict(self) -> dict:
         return {
@@ -149,9 +152,9 @@ class AgentCore:
 
     # -- 1) Plan-and-Execute ------------------------------------------------
 
-    def plan(self, goal: str, hint: str = "") -> List[Dict[str, str]]:
+    def plan(self, goal: str, hint: str = "", context: str = "") -> List[Dict[str, str]]:
         """把目标拆成有序工具计划（此处不跑任何工具）。"""
-        system = _PLAN_SYSTEM.format(tools=self._tools_desc())
+        system = _PLAN_SYSTEM.format(tools=self._tools_desc(), context=context or "(无 | none)")
         user = goal if not hint else f"{goal}\n\n反思提示 | hint: {hint}"
         raw = self.llm.complete(system, user)
         try:
@@ -177,7 +180,8 @@ class AgentCore:
         for _ in range(self.max_act_steps):
             history = self._render_history(run)
             system = _ACT_SYSTEM.format(
-                tools=self._tools_desc(), goal=run.goal, plan=plan_text, history=history)
+                tools=self._tools_desc(), goal=run.goal, plan=plan_text, history=history,
+                context=run.context or "(无 | none)")
             text = self.llm.complete(system, "继续 | continue")
             thought, action = self._parse(text)
             if thought:
@@ -267,10 +271,13 @@ class AgentCore:
 
     # -- 编排 ---------------------------------------------------------------
 
-    def run(self, goal: str) -> AgentRun:
-        """一次完整自治运行：先 Plan，再 Act/Reflect 直到足够好。"""
-        run = AgentRun(goal=goal)
-        run.plan = self.plan(goal)
+    def run(self, goal: str, context: str = "") -> AgentRun:
+        """一次完整自治运行：先 Plan，再 Act/Reflect 直到足够好。
+
+        context：会话背景（近期对话 + 上次扫描结果），让“把这个忽略”这类多轮指代能解析。
+        """
+        run = AgentRun(goal=goal, context=context or "")
+        run.plan = self.plan(goal, context=run.context)
         for round_i in range(1, self.max_rounds + 1):
             run.rounds = round_i
             self.act(run)
@@ -281,5 +288,5 @@ class AgentCore:
             hint = verdict.get("next") or "; ".join(verdict.get("missing", []))
             if not hint:
                 break
-            run.plan = self.plan(goal, hint=hint)  # 带反思提示重规划
+            run.plan = self.plan(goal, hint=hint, context=run.context)  # 带反思提示重规划
         return run

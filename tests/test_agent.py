@@ -160,3 +160,26 @@ def test_run_replans_then_stops():
     assert len(run.reflections) == 2
     assert run.reflections[0]["complete"] is False
     assert run.reflections[1]["complete"] is True
+
+
+def test_context_flows_into_plan_and_act():
+    """会话背景应注入 plan 与 act 的系统提示，让多轮指代（如「把这个忽略」）能解析。"""
+    seen = {}
+
+    class CapLLM:
+        available = True
+
+        def complete(self, system, user):
+            if "规划器" in system:
+                seen["plan"] = system
+                return '[{"tool": "echo", "why": "x"}]'
+            if "执行器" in system:
+                seen["act"] = system
+                return "Action: Finish[done]"
+            return '{"score": 9, "complete": true, "missing": [], "next": ""}'
+
+    core = AgentCore(CapLLM())
+    core.run(goal="把这个忽略", context="上次盲区: app.py::get_user [cache]")
+    assert "app.py::get_user" in seen.get("plan", "")
+    assert "app.py::get_user" in seen.get("act", "")
+

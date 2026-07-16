@@ -529,8 +529,54 @@ def _controls(pending=None, candidates=None):
     return radio, gr.update(visible=show), gr.update(visible=show)
 
 
-def _agent_turn(state: dict, goal: str):
-    """跑一次 agent，返回 (回复文本, 待授权路径, 候选路径)。"""
+def _stash_scan(state: dict, report) -> None:
+    """把一次扫描的盲区快照存进会话态，供下一轮解析「把这个忽略」这类指代。"""
+    if not isinstance(report, dict) or "blind_spots" not in report:
+        return
+    state["last_scan"] = {
+        "repo": report.get("repo", ""),
+        "spots": [
+            {"unit_id": b.get("unit_id") or f"{b.get('file')}::{b.get('function')}",
+             "function": b.get("function", ""),
+             "signals": b.get("signals", [])}
+            for b in report.get("blind_spots", [])
+        ],
+    }
+
+
+def _stash_scan_from_run(state: dict, run: AgentRun) -> None:
+    """从一次 agent run 的 transcript 里取最后一份扫描报告，存快照。"""
+    for rep in reversed(_scan_reports(run)):
+        if isinstance(rep, dict) and rep.get("blind_spots"):
+            _stash_scan(state, rep)
+            return
+
+
+def _recent_context(chat, state: dict, max_turns: int = 4) -> str:
+    """拼「会话背景」：上次扫描的盲区（含 unit_id）+ 近期几轮对话。喂给 agent 解析指代。"""
+    lines: List[str] = []
+    last = state.get("last_scan")
+    if last and last.get("spots"):
+        lines.append(f"上次扫描的仓库 | last scanned repo: {last.get('repo', '')}")
+        lines.append("上次发现的监控盲区（若用户说「忽略/这个不用/不用加」，通常指这些函数，"
+                     "请对相应 unit_id 调用 ignore_finding）| blind spots from last scan:")
+        for s in last["spots"][:10]:
+            sig = ", ".join(s.get("signals", [])) or "-"
+            lines.append(f"  - {s['unit_id']} [{sig}]")
+        lines.append("")
+    # 近期对话（排除当前这条用户消息 = chat[-1]）。
+    prior = [m for m in (chat or []) if m.get("role") in ("user", "assistant")][:-1]
+    for m in prior[-max_turns:]:
+        who = "用户" if m["role"] == "user" else "Sentinel"
+        lines.append(f"{who}: {_clip(m.get('content', ''), 140)}")
+    return "\n".join(lines).strip()
+
+
+def _agent_turn(state: dict, goal: str, context: str = ""):
+    """跑一次 agent，返回 (回复文本, 待授权路径, 候选路径)。
+
+    context：会话背景（近期对话 + 上次扫描盲区），让「把这个忽略」这类指代能解析。
+    """
     broker: PermissionBroker = state["broker"]
     state["goal"] = goal
 
@@ -539,12 +585,16 @@ def _agent_turn(state: dict, goal: str):
         note = f"_（无 LLM key，纯扫描模式：{_LLM.why_unavailable()}）_\n\n"
         if path and broker.within_scope(path):
             _authorize_open(path)  # 显式发起扫描 = 隐含同意，其文件可被 /open 打开
-            return note + _format_scan_result(path), [], []
+            report = build_scan_tool(broker=None, memory=_get_memory()).func(path)
+            _stash_scan(state, report)
+            return note + (_render_report(report) if isinstance(report, dict)
+                           and "blind_spots" in report else str(report)), [], []
         if path:
             return note + f"⚠️ `{path}` 超出允许范围（{broker.root}）。", [], []
         return note + f"给我一个（{broker.root} 内的）仓库路径或项目名。", [], []
 
-    run = _build_agent(broker).run(goal=goal)
+    run = _build_agent(broker).run(goal=goal, context=context)
+    _stash_scan_from_run(state, run)                       # 记下本轮扫描盲区，供下一轮指代
     pending = _collect(run, "permission_required")
     if pending:
         matches = _all_matches(run)
@@ -571,6 +621,7 @@ def _approve(state: dict, selected: Optional[str]):
     _authorize_open(target)  # 授权成功 → 其下文件今后可被 /open 打开
     report = build_scan_tool(broker, memory=_get_memory()).func(target)
     if isinstance(report, dict) and "blind_spots" in report:
+        _stash_scan(state, report)                        # 存盲区快照，供下一轮指代
         return _render_report(report)
     return _format_scan_result(target)  # 兜底
 
@@ -602,7 +653,8 @@ def _ui_bot(chat, state):
     else:
         state["pending"] = []
         state["candidates"] = []
-        reply, pending, candidates = _agent_turn(state, msg)
+        ctx = _recent_context(chat, state)               # 会话背景（上次扫描 + 近期对话）
+        reply, pending, candidates = _agent_turn(state, msg, context=ctx)
         state["pending"] = pending
         state["candidates"] = candidates
 
