@@ -147,19 +147,22 @@ flowchart TB
 
 > **不做可选隐私档**。定一条默认路径，用一个抽象接口留出「日后切生产私有部署」的口子——这正是企业「本地开发 → 生产自建」的真实路径。
 
-### 5.1 Embedding
-- 走已有的 provider 抽象（OpenAI 兼容的 `/embeddings`），默认用云 Embedding API（简单、效果好）。
-- 要换**自建 embedding 模型**（bge/e5 等，代码不出网）只改这一处适配。
+### 5.1 Embedding（`Embedder` 抽象 + 本地 fastembed 默认）
+- **默认走本地 `fastembed`**（ONNX，不依赖 PyTorch，模型 ~100MB，CPU 即可）。理由：Sentinel 读的是**他人私有代码**，把代码发给云 Embedding API 是数据合规红线——本地嵌入 = **代码永不出本机**（air-gapped，呼应 §14）。
+- `Embedder` 抽象隔离，要换云（OpenAI `/embeddings`）或自建 bge/e5 只改这一处。
+- 测试用 `HashEmbedder`（哈希技巧的确定性假向量，零依赖/不联网/不下载模型）。
+- **喂给 embedding 的文本**（Q1 决定）：`qualname + signature + docstring + calls` 的语义摘要，**不含整段源码**（噪声大）；改动人（git blame）等**元数据不进 embedding，存 payload**，用于后续路由通知/过滤。
 
-### 5.2 向量库（`VectorStore` 抽象接口 + 本地嵌入式默认）
+### 5.2 向量库（`VectorStore` 抽象接口 + Qdrant 本地模式默认）
 ```
 VectorStore(port)  ← 上层只认接口
-  ├─ 默认实现：本地嵌入式（文件型，零服务端；离线可测、demo 好演示）
-  └─ 可切换 adapter：自建 Qdrant / Milvus / pgvector（生产私有部署，数据不出网）
+  ├─ 默认实现：Qdrant 本地嵌入式模式（QdrantClient(path=...)，进程内、无需 Docker 服务）
+  ├─ 测试实现：MemoryStore（numpy 暴力余弦，不依赖 qdrant，CI 友好）
+  └─ 可切换 adapter：远程 Qdrant / Milvus / pgvector（生产私有部署，数据不出网）
 ```
-**企业现实对照**（why 这样设计）：
-- 企业生产多为**自建服务端**（VPC 内 Qdrant/Milvus 或复用 Postgres+pgvector），数据不出网。
-- **本地嵌入式**（FAISS/Chroma/LanceDB/sqlite-vec）用于开发/单机/air-gapped——我们默认用它，接口一致，日后一行配置切自建。
+**关键认知**：**embedding 决定「准不准」，向量库决定「快不快/多大」**，两者正交——所以 MemoryStore 与 Qdrant 在我们规模下**召回结果一致**，Qdrant 的价值在规模化（ANN/HNSW/持久化/过滤）。
+**企业现实对照**：生产多为 VPC 内自建 Qdrant/Milvus 或 Postgres+pgvector，数据不出网；本地模式用于开发/单机/air-gapped，接口一致，一行配置切远程。
+
 
 ### 5.3 固定规则（硬约束，非可选档）
 - 送去向量化/上云的**只有代码单元文本（签名/docstring/calls）**，**绝不发整文件、不发字面量里的敏感值**（§3.1 脱敏）。这是固定好习惯，不是可切换的「隐私档」。
