@@ -575,23 +575,19 @@ def _stash_scan_from_run(state: dict, run: AgentRun) -> None:
 
 
 def _recent_context(chat, state: dict, max_turns: int = 4) -> str:
-    """拼「会话背景」：上次扫描的盲区（含 unit_id）+ 近期几轮对话。喂给 agent 解析指代。"""
-    lines: List[str] = []
+    """拼「会话背景」——走**同一套 ContextBuilder**（预算/去重/压缩/溯源一致）。
+
+    与 judge 的区别只是换了 provider：LastScan（上次盲区）+ Note（仓库约定）+ Conversation。
+    这样「每一次 LLM 调用（plan/act/judge）都遵守同一套上下文纪律」。
+    """
+    from sentinel.cognition.context_builder import ContextTarget, default_turn_builder
     last = state.get("last_scan")
-    if last and last.get("spots"):
-        lines.append(f"上次扫描的仓库 | last scanned repo: {last.get('repo', '')}")
-        lines.append("上次发现的监控盲区（若用户说「忽略/这个不用/不用加」，通常指这些函数，"
-                     "请对相应 unit_id 调用 ignore_finding）| blind spots from last scan:")
-        for s in last["spots"][:10]:
-            sig = ", ".join(s.get("signals", [])) or "-"
-            lines.append(f"  - {s['unit_id']} [{sig}]")
-        lines.append("")
-    # 近期对话（排除当前这条用户消息 = chat[-1]）。
-    prior = [m for m in (chat or []) if m.get("role") in ("user", "assistant")][:-1]
-    for m in prior[-max_turns:]:
-        who = "用户" if m["role"] == "user" else "Sentinel"
-        lines.append(f"{who}: {_clip(m.get('content', ''), 140)}")
-    return "\n".join(lines).strip()
+    turns = [(m["role"], m.get("content", ""))
+             for m in (chat or []) if m.get("role") in ("user", "assistant")][:-1]
+    repo = (last or {}).get("repo", "")
+    target = ContextTarget(repo=repo, turns=turns[-max_turns:], last_scan=last)
+    ctx = default_turn_builder(notes=_get_notes()).build(target)
+    return ctx.text
 
 
 def _agent_turn(state: dict, goal: str, context: str = ""):

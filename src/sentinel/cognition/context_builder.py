@@ -26,7 +26,10 @@ SRC_HISTORY = "history"
 SRC_NOTE = "note"
 SRC_PEER = "peer"
 SRC_KNOWLEDGE = "knowledge"
-_RENDER_ORDER = [SRC_TARGET, SRC_HISTORY, SRC_NOTE, SRC_PEER, SRC_KNOWLEDGE]
+SRC_SCAN = "scan"                # 对话级：上次扫描的盲区快照
+SRC_CONVERSATION = "conversation"  # 对话级：近期对话
+_RENDER_ORDER = [SRC_TARGET, SRC_SCAN, SRC_HISTORY, SRC_NOTE, SRC_PEER,
+                 SRC_KNOWLEDGE, SRC_CONVERSATION]
 
 _SRC_HEADER = {
     SRC_TARGET: "[FUNCTION] 待判定函数 | function under judgement",
@@ -34,6 +37,8 @@ _SRC_HEADER = {
     SRC_NOTE: "[NOTES] 相关团队笔记 | relevant team notes",
     SRC_PEER: "[PEERS] 同仓库已埋点的相似函数 | similar already-instrumented peers",
     SRC_KNOWLEDGE: "[KNOWLEDGE] RED/USE 经验 | RED/USE knowledge",
+    SRC_SCAN: "[LAST SCAN] 上次扫描的盲区 | blind spots from last scan",
+    SRC_CONVERSATION: "[CONVERSATION] 近期对话 | recent conversation",
 }
 
 
@@ -47,14 +52,23 @@ def estimate_tokens(text: str) -> int:
 
 @dataclass
 class ContextTarget:
-    """一次上下文构建的目标：待判定的函数 + 它所在仓库 + 命中的信号。"""
-    unit: CodeUnit
+    """一次上下文构建的目标。
+
+    同一个 ContextBuilder 靠不同 provider 服务不同场景，所以这里把两类场景的字段都放一起：
+    - 判定场景（judge）：unit / repo / signals。
+    - 对话场景（每轮 plan/act）：goal / turns（近期对话）/ last_scan（上次扫描快照）。
+    provider 各取所需，不相关的字段留空即可。
+    """
+    unit: Optional[CodeUnit] = None
     repo: str = ""
     signals: List[str] = field(default_factory=list)
+    goal: str = ""                                   # 本轮用户目标（对话级）
+    turns: List = field(default_factory=list)        # 近期对话 [(role, content), ...]
+    last_scan: Optional[dict] = None                 # 上次扫描快照 {repo, spots:[{unit_id,signals}]}
 
     @property
     def unit_id(self) -> str:
-        return self.unit.unit_id
+        return self.unit.unit_id if self.unit is not None else ""
 
 
 @dataclass
@@ -240,6 +254,8 @@ class TargetProvider(EvidenceProvider):
 
     def provide(self, target: ContextTarget) -> List[ContextSection]:
         u = target.unit
+        if u is None:
+            return []
         content = (
             f"unit_id: {u.unit_id}\n"
             f"signature: {u.qualname}{u.signature}\n"
@@ -265,7 +281,7 @@ class HistoryProvider(EvidenceProvider):
         self.episodic = episodic
 
     def provide(self, target: ContextTarget) -> List[ContextSection]:
-        if self.episodic is None or not target.repo:
+        if self.episodic is None or not target.repo or not target.unit_id:
             return []
         rows = [r for r in self.episodic.list_feedback(target.repo)
                 if r.unit_id == target.unit_id]
@@ -315,7 +331,7 @@ class PeerProvider(EvidenceProvider):
         self.max_peers = max_peers
 
     def provide(self, target: ContextTarget) -> List[ContextSection]:
-        if self.index is None:
+        if self.index is None or target.unit is None:
             return []
         from sentinel.cognition.embedder import embedding_text
         q = embedding_text(target.unit)
@@ -363,3 +379,65 @@ def default_judge_builder(index=None, notes=None, episodic=None,
         ],
         token_budget=token_budget,
     )
+
+
+# =====================================================================
+# 对话级证据源（每轮 plan/act 用同一套 ContextBuilder）
+# =====================================================================
+
+class LastScanProvider(EvidenceProvider):
+    """上次扫描的盲区快照：让「把这个忽略」这类指代有据可依（含 unit_id）。"""
+
+    def provide(self, target: ContextTarget) -> List[ContextSection]:
+        ls = target.last_scan
+        if not ls or not ls.get("spots"):
+            return []
+        lines = [f"上次扫描仓库 | repo: {ls.get('repo', '')}",
+                 "盲区（用户说「忽略/这个不用/不用加」通常指这些，请对相应 unit_id 调 ignore_finding）:"]
+        for s in ls["spots"][:10]:
+            sig = ", ".join(s.get("signals", [])) or "-"
+            lines.append(f"  - {s['unit_id']} [{sig}]")
+        full = "\n".join(lines)
+        compact = "上次盲区 | last blind spots: " + ", ".join(
+            s["unit_id"] for s in ls["spots"][:10])
+        return [ContextSection(SRC_SCAN, "last scan", full, priority=88,
+                               ref="", compact=compact, min_chars=20)]
+
+
+class ConversationProvider(EvidenceProvider):
+    """近期对话：让多轮指代能解析。越近的轮次优先级越高。"""
+
+    def __init__(self, max_turns: int = 4):
+        self.max_turns = max_turns
+
+    def provide(self, target: ContextTarget) -> List[ContextSection]:
+        turns = list(target.turns or [])[-self.max_turns:]
+        out: List[ContextSection] = []
+        for i, item in enumerate(turns):
+            try:
+                role, content = item
+            except (ValueError, TypeError):
+                continue
+            who = "用户" if role == "user" else "Sentinel"
+            full = f"- {who}: {(content or '').strip()}"
+            compact = f"- {who}: {_trunc(content, 80)}"
+            out.append(ContextSection(SRC_CONVERSATION, f"turn{i}", full,
+                                      priority=58 + i,  # 越近越高
+                                      ref="", compact=compact, min_chars=16))
+        return out
+
+
+def default_turn_builder(notes=None, token_budget: int = 800) -> ContextBuilder:
+    """每轮 plan/act 用的默认构建器：LastScan + Note（仓库约定）+ Conversation。
+
+    与 judge 用同一套 ContextBuilder（预算/去重/压缩/溯源一致），只是换了 provider 组合。
+    """
+    return ContextBuilder(
+        providers=[
+            LastScanProvider(),
+            NoteProvider(notes),
+            ConversationProvider(),
+        ],
+        token_budget=token_budget,
+    )
+

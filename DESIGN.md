@@ -252,6 +252,17 @@ flowchart LR
 - **笔记闭环**：`memory/notes.py` `NoteStore`（SQLite，作用域 unit>repo>global + 标签）。Agent/用户用 `add_note`/`recall_notes` 记团队约定，`NoteProvider` 判定时自动召回注入——**Sentinel 越用越懂这个团队的规矩**。
 - **容错**：任一 provider 抛错只跳过该源，不拖垮整体（§13）。
 
+#### 7.1.2 一套 ContextBuilder 管到底：每一次 LLM 调用都构建上下文
+
+上下文工程不是 judge 的专利——**plan / act / judge 每一次模型调用都走同一套 ContextBuilder**，只是换 provider 组合：
+
+| 场景 | 每次调用 | provider 组合 |
+|---|---|---|
+| 每轮对话（plan/act 循环） | 每条消息 | `LastScan`(上次盲区) + `Note`(仓库约定) + `Conversation`(近期对话) |
+| 判定盲区（judge_intent） | 每个盲区函数 | `Target` + `History` + `Note` + `Peer` + `Knowledge` |
+
+`ContextTarget` 是通用的「上下文请求」（unit / repo / signals 给判定用；goal / turns / last_scan 给对话用），unit 相关 provider 在无 unit 时安全返回空。这样**预算、去重、分级压缩、溯源**这套纪律对每一次 LLM 调用统一生效——对话轮不再是「手拼字符串」，判定也不再特殊。`default_turn_builder` / `default_judge_builder` 两个工厂各配一套 provider。
+
 ### 7.2 召回率怎么看（评估，第12章）
 - `eval/fixtures/*`：标注好「理想应监控的指标」的样例仓库 + `expected.json`。
 - 指标：**Precision（准不准）/ Recall（全不全，即覆盖度）/ F1**，按 signal 分类召回 + 混淆矩阵。

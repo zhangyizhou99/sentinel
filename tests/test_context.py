@@ -11,7 +11,8 @@ from sentinel.model.code_unit import CodeUnit  # noqa: E402
 from sentinel.cognition.context_builder import (  # noqa: E402
     ContextBuilder, ContextTarget, ContextSection, EvidenceProvider,
     TargetProvider, NoteProvider, KnowledgeProvider, HistoryProvider,
-    default_judge_builder, estimate_tokens,
+    LastScanProvider, ConversationProvider, default_judge_builder,
+    default_turn_builder, estimate_tokens,
 )
 
 
@@ -169,4 +170,25 @@ def test_optional_llm_compressor_hook():
     note = next((s for s in ctx.sections if s.source == "note"), None)
     assert calls["n"] == 1 and note and note.level == "summarized"
     assert "SUMMARY" in ctx.text
+
+
+# ---- 对话级：同一套 builder 服务每轮 plan/act ----------------------------
+
+def test_turn_builder_conversation_and_last_scan():
+    last = {"repo": "/tmp/r",
+            "spots": [{"unit_id": "app.py::get_user", "signals": ["cache"]}]}
+    turns = [("user", "扫一下 sample-app"), ("assistant", "发现 1 个盲区 get_user"),
+             ("user", "这个不用加了")]
+    ctx = default_turn_builder(notes=None).build(
+        ContextTarget(repo="/tmp/r", turns=turns, last_scan=last))
+    assert "[LAST SCAN]" in ctx.text and "app.py::get_user" in ctx.text  # 指代有据
+    assert "[CONVERSATION]" in ctx.text and "这个不用加了" in ctx.text     # 近期对话在
+
+
+def test_unit_providers_safe_without_unit():
+    # 对话级目标没有 unit：Target/Peer 应安全返回空，不报错
+    t = ContextTarget(repo="/tmp/r", turns=[("user", "hi")])
+    assert TargetProvider().provide(t) == []
+    b = default_turn_builder(notes=None).build(t)
+    assert all(s.source != "target" for s in b.sections)
 
