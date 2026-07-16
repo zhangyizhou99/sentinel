@@ -12,6 +12,7 @@ from typing import Optional
 from sentinel import __version__
 from sentinel.llm import LLMClient
 from sentinel.engines.scan import scan_repo, signals_of
+from sentinel.memory import EpisodicMemory, IGNORE, INSTRUMENT
 
 # 系统提示：定义这个 Agent 的身份。后续会逐步丰富。
 SYSTEM_PROMPT = "你是 Sentinel，一个可观测性守护 Agent 的雏形。用中文简洁回答。"
@@ -28,16 +29,53 @@ def cmd_ping(args: argparse.Namespace) -> None:
 
 
 def cmd_scan(args: argparse.Namespace) -> None:
-    """扫描仓库，列出监控盲区（纯静态，不用 LLM）。"""
+    """扫描仓库，列出监控盲区（纯静态，不用 LLM）。
+
+    带上情节记忆：抑制此前被标为「不用埋点」的函数（反馈学习），并记录本次运行。
+    """
+    memory = EpisodicMemory()
     result = scan_repo(args.repo)
-    blind = result.blind_spots
-    print(f"扫描 {args.repo}：共 {len(result.units)} 个函数/方法，发现 {len(blind)} 个监控盲区\n")
-    for u in blind:
+    spots = result.blind_spots
+
+    ignored = memory.ignored_units(args.repo)
+    kept = [u for u in spots if u.unit_id not in ignored]
+    suppressed = len(spots) - len(kept)
+    spots = kept
+
+    note = f"（已抑制 {suppressed} 个你此前标记忽略的函数）" if suppressed else ""
+    print(f"扫描 {args.repo}：共 {len(result.units)} 个函数/方法，"
+          f"发现 {len(spots)} 个监控盲区{note}\n")
+    for u in spots:
         sigs = "/".join(signals_of(u))
-        print(f"  ⚠ {u.file}::{u.qualname}  [{sigs}]  行 {u.start_line}-{u.end_line}")
+        print(f"  ⚠ {u.unit_id}  [{sigs}]  行 {u.start_line}-{u.end_line}")
         print(f"     调用: {', '.join(u.calls)}")
-    if not blind:
+    if not spots:
         print("  ✅ 未发现盲区（或仓库无可观测性相关调用）")
+    memory.record_run(args.repo, blind_spot_count=len(spots), suppressed_count=suppressed)
+    memory.close()
+
+
+def cmd_feedback(args: argparse.Namespace) -> None:
+    """记录/查看对某仓库的反馈（哪些函数不用埋点）。反馈会在下次 scan 时生效。"""
+    memory = EpisodicMemory()
+    if args.list:
+        rows = memory.list_feedback(args.repo)
+        if not rows:
+            print(f"{args.repo} 暂无反馈记录。")
+        for r in rows:
+            print(f"  [{r.decision}] {r.unit_id}" + (f"  # {r.note}" if r.note else ""))
+        memory.close()
+        return
+    if not args.unit_id:
+        print("请提供 unit_id（文件::函数名），或用 --list 查看已有反馈。")
+        memory.close()
+        return
+    decision = INSTRUMENT if args.instrument else IGNORE
+    memory.record_feedback(args.repo, args.unit_id, decision)
+    verb = "会重新提示埋点" if decision == INSTRUMENT else "下次扫描将抑制"
+    print(f"已记录：{args.repo} :: {args.unit_id} → {decision}（{verb}）")
+    memory.close()
+
 
 
 
@@ -56,6 +94,14 @@ def build_parser() -> argparse.ArgumentParser:
     scan = sub.add_parser("scan", help="扫描仓库，列出监控盲区（纯静态，不用 LLM）")
     scan.add_argument("repo", help="仓库路径或单个 .py 文件")
     scan.set_defaults(func=cmd_scan)
+
+    fb = sub.add_parser("feedback", help="标记某函数是否需要埋点；反馈在下次 scan 生效")
+    fb.add_argument("repo", help="仓库路径")
+    fb.add_argument("unit_id", nargs="?", help="函数标识：相对文件路径::函数名")
+    fb.add_argument("--ignore", action="store_true", help="标为不用埋点（默认）")
+    fb.add_argument("--instrument", action="store_true", help="标为需要埋点（撤销忽略）")
+    fb.add_argument("--list", action="store_true", help="列出该仓库已有反馈")
+    fb.set_defaults(func=cmd_feedback)
 
     return parser
 

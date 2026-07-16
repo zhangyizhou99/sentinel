@@ -79,3 +79,22 @@ def workspace_root() -> str:
         os.getenv("SENTINEL_WORKSPACE_ROOT") or os.getcwd()
     ))
 
+
+def cache_dir() -> str:
+    """Sentinel 的缓存/状态目录（记忆、查询缓存等都放这）。
+
+    默认 ~/.cache/sentinel，可用 SENTINEL_CACHE_DIR 覆盖。放用户目录而非仓库内，
+    避免污染被扫描的目标仓库。首次访问时确保目录存在。
+    """
+    path = os.path.abspath(os.path.expanduser(
+        os.getenv("SENTINEL_CACHE_DIR") or os.path.join("~", ".cache", "sentinel")
+    ))
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def episodic_db_path() -> str:
+    """情节记忆（SQLite）文件路径：记录每次运行与用户反馈（DESIGN §11 Agentic-RL）。"""
+    return os.path.join(cache_dir(), "episodic.db")
+
+

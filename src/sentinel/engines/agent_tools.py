@@ -108,11 +108,13 @@ def build_find_repo_tool(broker: PermissionBroker) -> Tool:
 
 # ---- scan：读取代码内容（需授权）--------------------------------------------
 
-def build_scan_tool(broker: Optional[PermissionBroker] = None) -> Tool:
+def build_scan_tool(broker: Optional[PermissionBroker] = None, memory=None) -> Tool:
     """构造 scan 工具。
 
     broker=None 时不做权限门（供 CLI 等「用户显式发起 = 已隐含同意」的场景）。
     传入 broker 时（如 Web 会话）：越界拒绝、未授权返回 permission_required。
+    传入 memory（EpisodicMemory）时：①抑制用户此前标为 ignore 的函数（反馈学习）；
+    ②把本次运行记入情节记忆流水。
     """
     def _scan(path: str) -> Dict[str, Any]:
         p = _clean(path)
@@ -131,20 +133,35 @@ def build_scan_tool(broker: Optional[PermissionBroker] = None) -> Tool:
 
         result = scan_repo(p)
         spots = result.blind_spots
-        return {
+
+        # 反馈学习：把用户此前标为「不用埋点」的函数从盲区里抑制掉（被拒的别再烦）。
+        suppressed = 0
+        if memory is not None:
+            ignored = memory.ignored_units(p)
+            if ignored:
+                kept = [u for u in spots if u.unit_id not in ignored]
+                suppressed = len(spots) - len(kept)
+                spots = kept
+
+        report = {
             "repo": p,
             "total_units": len(result.units),
             "blind_spot_count": len(spots),
+            "suppressed_count": suppressed,
             "blind_spots": [
                 {
                     "file": u.file,
                     "function": u.qualname,
+                    "unit_id": u.unit_id,
                     "signals": signals_of(u),
                     "lines": f"{u.start_line}-{u.end_line}",
                 }
                 for u in spots[:_MAX_REPORTED]
             ],
         }
+        if memory is not None:
+            memory.record_run(p, blind_spot_count=len(spots), suppressed_count=suppressed)
+        return report
 
     return Tool("scan", _SCAN_DESC, _scan)
 
@@ -215,3 +232,40 @@ def build_install_language_tool(llm=None) -> Tool:
         return install_language_support(lang, llm=llm)
 
     return Tool("install_language_support", _INSTALL_LANG_DESC, _install)
+
+
+# ---- ignore_finding：把某盲区标为「不用埋点」，形成反馈学习（Agentic-RL）--------
+
+_IGNORE_DESC = (
+    "ignore_finding(函数标识) — 把某个盲区函数标记为「不需要埋点」。之后再扫同一仓库时，"
+    "该函数会被自动抑制、不再报为盲区（这就是 Sentinel 的反馈学习：被你拒过的别再烦你）。"
+    "输入：函数标识 unit_id，即扫描结果里的「相对文件路径::函数名」（如 svc/order.py::create_order）。"
+    "仅当用户明确表示某函数不用埋点时才调用；针对的是最近一次扫描的那个仓库。 | "
+    "ignore_finding(unit_id) — Mark a blind-spot function as 'no instrumentation needed'. "
+    "Future scans of the same repo will suppress it (this is Sentinel's feedback learning: "
+    "don't nag about what you rejected). Input: the unit_id 'relative/path.py::qualname' from "
+    "the scan report. Call only when the user explicitly says a function needs no instrumentation; "
+    "applies to the most recently scanned repo."
+)
+
+
+def build_feedback_tool(memory) -> Tool:
+    """构造 ignore_finding 工具：记录「不用埋点」的裁决，驱动下次扫描抑制。
+
+    针对 memory.last_repo（最近扫过的仓库）。没扫过则提示先扫。
+    """
+    from sentinel.memory import IGNORE
+
+    def _ignore(unit_id: str) -> Dict[str, Any]:
+        uid = _clean(unit_id)
+        if not uid:
+            raise ValueError("需要函数标识 unit_id（文件::函数名）| unit_id required")
+        repo = getattr(memory, "last_repo", None)
+        if not repo:
+            return {"error": "还没有扫描过任何仓库，无法确定归属；请先扫描再标记 "
+                             "| no repo scanned yet; scan first"}
+        memory.record_feedback(repo, uid, IGNORE)
+        return {"ok": True, "repo": repo, "unit_id": uid,
+                "note": "已记录：下次扫描将抑制该函数 | recorded; suppressed on next scan"}
+
+    return Tool("ignore_finding", _IGNORE_DESC, _ignore)

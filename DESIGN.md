@@ -88,7 +88,7 @@ flowchart TB
 | 7 | 生成 + 部署 | — | 埋点/告警/看板 → Grafana + Slack | 真实闭环（复用 legacy 逻辑） |
 | 8 | 评估 | 12 | fixtures + P/R/F1 | 召回率有数字 |
 | 9 | 通信协议 | 10 | MCP server | 被别的 agent 调用 |
-| 10 | Agentic-RL | 11 | 反馈学习：被拒不再提 | 第2次运行抑制生效 |
+| 10 | Agentic-RL ✅ | 11 | 反馈学习：被拒不再提（情节记忆 SQLite runs+feedback，scan 自动抑制） | 第2次扫描抑制生效✓ |
 | 11 | 驾驶舱 + 毕设 | 13-16 | Web + README + 文档 | 可视化 + 可演示 |
 
 ---
@@ -202,7 +202,7 @@ VectorStore(port)  ← 上层只认接口
 | `deploy_dashboard` | 看板 JSON → **推 Grafana**（幂等 upsert） | **是** | — |
 | `deploy_alerts` | 告警 policy → **推 Grafana**（联络点/路由） | **是** | — |
 | `blame_route` | 代码单元 → 作者/通知目标（git blame） | 否 | 6 |
-| `feedback` | metric+verdict → 记录 approve/reject | 否 | 11 |
+| `ignore_finding` | unit_id → 标为「不用埋点」，下次 scan 自动抑制（反馈学习·已落地） | 否 | 11 |
 | `evaluate` | fixtures → P/R/F1 | 否 | 12 |
 
 > **一键告警 / 一键看板** = `gen_alert` + `deploy_alerts`（或 `gen_dashboard` + `deploy_dashboard`）的组合，由编排层串起来；两个 deploy 均为**破坏性**，必过人审门。这套 legacy 已跑通（Grafana Provisioning API + OTLP→Grafana→Slack 真实闭环），新项目复用其逻辑但按本文档重构。

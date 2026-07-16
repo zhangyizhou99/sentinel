@@ -42,6 +42,7 @@ from sentinel.engines.agent_tools import (
     build_scan_tool,
     build_check_language_tool,
     build_install_language_tool,
+    build_feedback_tool,
 )
 from sentinel.engines.scan import scan_repo, signals_of
 from sentinel.engines.judge import judge_intent, _peers
@@ -52,6 +53,17 @@ from sentinel.permissions import PermissionBroker
 
 # 全局单例：LLM 客户端（无 key 时 available=False，走降级路径，不崩）。
 _LLM = LLMClient()
+
+# 情节记忆单例：跨会话/跨接口共享（CLI 标的忽略，Web 扫描也会抑制）。
+_MEMORY = None
+
+
+def _get_memory():
+    global _MEMORY
+    if _MEMORY is None:
+        from sentinel.memory import EpisodicMemory
+        _MEMORY = EpisodicMemory()
+    return _MEMORY
 
 # 意图判定用的向量索引 embedder 单例（避免每条消息重载模型）。
 _EMBEDDER = None
@@ -79,12 +91,14 @@ def _is_open_authorized(ap: str) -> bool:
 
 
 def _build_agent(broker: PermissionBroker) -> AgentCore:
-    """构造带 find_repo + scan + 语言能力检测/补齐 四个工具的 agent（均受该会话权限门约束）。"""
+    """构造带 find_repo + scan + 语言检测/补齐 + 反馈 五个工具的 agent（均受该会话权限门约束）。"""
+    mem = _get_memory()
     find = build_find_repo_tool(broker)
-    scan = build_scan_tool(broker)
+    scan = build_scan_tool(broker, memory=mem)            # 带记忆：抑制被拒的 + 记录运行
     check = build_check_language_tool(broker)             # 只读：报告语言覆盖缺口
     install = build_install_language_tool(_LLM)           # 破坏性：须用户明确同意后才补齐
-    tools = {t.name: t for t in (find, scan, check, install)}
+    ignore = build_feedback_tool(mem)                     # 反馈学习：标为不用埋点→下次抑制
+    tools = {t.name: t for t in (find, scan, check, install, ignore)}
     return AgentCore(_LLM, tools=tools)
 
 
@@ -137,8 +151,10 @@ def _render_report(data: dict) -> str:
     """把一份 scan 报告渲染成易读表格；文件名做成可点击的 VS Code 深链。"""
     spots = data.get("blind_spots", [])
     repo = data.get("repo", "")
+    suppressed = data.get("suppressed_count", 0)
+    supp_note = f"（已抑制 **{suppressed}** 个你此前标记忽略的函数）" if suppressed else ""
     head = (f"扫描 `{repo or '?'}`：共 **{data.get('total_units', '?')}** 个函数，"
-            f"发现 **{data.get('blind_spot_count', len(spots))}** 个监控盲区。")
+            f"发现 **{data.get('blind_spot_count', len(spots))}** 个监控盲区{supp_note}。")
     if not spots:
         return head + "\n\n✅ 没有明显盲区。"
     rows = ["| 文件（点击在 VS Code 打开） | 函数 | 风险信号 | 行 |", "| --- | --- | --- | --- |"]
@@ -315,18 +331,14 @@ def _format_run(run: AgentRun) -> str:
 
 
 def _format_scan_result(path: str) -> str:
-    """降级模式：不经 LLM，直接扫描并渲染盲区表（文件名可点击跳 VS Code）。"""
-    result = scan_repo(path)
-    spots = result.blind_spots
-    head = f"扫描 `{path}`：共 **{len(result.units)}** 个函数，发现 **{len(spots)}** 个监控盲区。"
-    if not spots:
-        return head + "\n\n✅ 没有明显盲区。"
-    rows = ["| 文件（点击在 VS Code 打开） | 函数 | 风险信号 | 行 |", "| --- | --- | --- | --- |"]
-    for u in spots[:30]:
-        link = _open_link(path, u.file, f"{u.start_line}-{u.end_line}")
-        file_cell = f"[{u.file}]({link})"
-        rows.append(f"| {file_cell} | `{u.qualname}` | {', '.join(signals_of(u)) or '-'} | {u.start_line}-{u.end_line} |")
-    return head + "\n\n" + "\n".join(rows)
+    """降级模式：不经 LLM，直接扫描并渲染盲区表（文件名可点击跳 VS Code）。
+
+    仍走带记忆的 scan 工具，这样反馈抑制/运行记录在无 LLM 时同样生效。
+    """
+    report = build_scan_tool(broker=None, memory=_get_memory()).func(path)
+    if isinstance(report, dict) and "blind_spots" in report:
+        return _render_report(report)
+    return f"扫描 `{path}` 未返回结果。"
 
 
 def _extract_path(message: str) -> Optional[str]:
@@ -535,7 +547,7 @@ def _approve(state: dict, selected: Optional[str]):
     except PermissionError as e:
         return f"⛔ {e}"
     _authorize_open(target)  # 授权成功 → 其下文件今后可被 /open 打开
-    report = build_scan_tool(broker).func(target)
+    report = build_scan_tool(broker, memory=_get_memory()).func(target)
     if isinstance(report, dict) and "blind_spots" in report:
         return _render_report(report)
     return _format_scan_result(target)  # 兜底
