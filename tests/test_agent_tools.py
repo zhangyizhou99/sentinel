@@ -1,4 +1,5 @@
 """scan / find_repo 工具封装测试（Tool ←→ scan/权限门 的桥）。"""
+import os
 import sys
 from pathlib import Path
 
@@ -81,4 +82,30 @@ def test_find_repo_exact_match_is_unique():
     tool = build_find_repo_tool(broker)
     res = tool.func("fixtures")
     assert res["matches"] == [str(_FIXTURES)]
+
+
+def test_find_repo_surfaces_children_for_semantic_pick(tmp_path):
+    """匹配目录若有子目录（如 backend/frontend），要如实列出，供 LLM 自行做语义判断，
+    而不是让 find_repo/代码去猜"前端"该等于哪个目录名——这是设计原则：
+    结构性事实（有哪些真实子目录）用代码列，语义选择交给 LLM。
+    """
+    proj = tmp_path / "haulhero"
+    (proj / "backend").mkdir(parents=True)
+    (proj / "frontend").mkdir()
+    (proj / "node_modules").mkdir()          # 生成物目录应被过滤，不出现在 children 里
+    broker = PermissionBroker(str(tmp_path))
+    tool = build_find_repo_tool(broker)
+    res = tool.func("haulhero")
+    assert res["matches"] == [str(proj)]
+    assert res["children"][str(proj)] == ["backend", "frontend"]  # node_modules 被过滤
+
+
+def test_find_repo_no_children_key_when_leaf_directory():
+    """没有子目录的匹配项不应出现在 children 里（保持返回精简）。"""
+    broker = PermissionBroker(str(_TESTS))
+    tool = build_find_repo_tool(broker)
+    res = tool.func("fixtures")
+    # fixtures 目录若无子目录，则不会作为 key 出现
+    if not any(os.path.isdir(os.path.join(str(_FIXTURES), d)) for d in os.listdir(_FIXTURES)):
+        assert str(_FIXTURES) not in res["children"]
 

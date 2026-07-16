@@ -23,10 +23,19 @@ from sentinel.permissions import PermissionBroker
 _FIND_DESC = (
     "find_repo(关键词) — 在允许的工作区内按名字查找项目/目录，返回匹配的绝对路径列表。"
     "当用户只给了项目名（而非完整绝对路径）时，先用它把名字解析成真实路径。"
-    "只浏览目录名，不读取文件内容，无需授权。 | "
+    "结果里的 children 会列出每个匹配目录下**真实存在**的一级子目录（如 backend/frontend）。"
+    "若用户的话里带了限定词（如「前端/后端/frontend/backend/web/mobile/客户端/服务端」等——"
+    "这类词五花八门、没有固定表，靠你自己按语义判断），你需要据此从 children 里选出对应的"
+    "子目录，把「匹配目录/子目录名」这个真实路径交给 scan——只能选 children 里列出的真实项，"
+    "禁止自己拼造不存在的子路径。若 children 为空或没有对应子目录，就用匹配目录本身。 | "
     "find_repo(keyword) — Locate a project/directory by name within the allowed workspace; "
     "returns a list of matching absolute paths. Use it to resolve a bare project name into a "
-    "real path before scanning. Lists directory names only; no file contents, no permission needed."
+    "real path before scanning. `children` lists the REAL immediate subdirectories of each match "
+    "(e.g. backend/frontend). If the user's phrasing implies a qualifier (frontend/backend/web/"
+    "mobile/client/server/前端/后端/... — an open-ended set, judge it semantically yourself), pick "
+    "the matching subdirectory from `children` and pass 'match/subdir' to scan — only choose from "
+    "the real entries listed, never invent a path. If there's no matching child, use the match "
+    "directory as-is. Lists directory names only; no file contents, no permission needed."
 )
 
 _SCAN_DESC = (
@@ -61,11 +70,26 @@ _MAX_REPORTED = 30
 # find_repo 限制：搜索深度与返回条数，避免在大目录树里跑飞。
 _FIND_MAX_DEPTH = 4
 _FIND_MAX_HITS = 20
+# 每个匹配目录最多列几个子目录（够 LLM 判断限定词，又不至于刷屏）。
+_FIND_MAX_CHILDREN = 20
 
 
 def _clean(arg: str) -> str:
     """清洗工具输入：去空白与包裹的引号。"""
     return (arg or "").strip().strip('"').strip("'")
+
+
+def _immediate_children(path: str) -> List[str]:
+    """列出一个目录的一级真实子目录（过滤生成物/隐藏目录），供 LLM 语义挑选，不臆造路径。"""
+    try:
+        names = sorted(
+            d for d in os.listdir(path)
+            if d not in _SKIP_DIRS and not d.startswith(".")
+            and os.path.isdir(os.path.join(path, d))
+        )
+    except OSError:
+        return []
+    return names[:_FIND_MAX_CHILDREN]
 
 
 # ---- find_repo：在 scope 内按名字找目录（免授权）-----------------------------
@@ -105,7 +129,11 @@ def build_find_repo_tool(broker: PermissionBroker) -> Tool:
         # 去嵌套：某匹配若在另一个匹配目录之内，丢弃深层的（保留顶层项目）。
         kept = [p for p in ranked
                 if not any(p != k and p.startswith(k + os.sep) for k in ranked)]
-        return {"query": query, "root": root, "matches": kept[:_FIND_MAX_HITS]}
+        kept = kept[:_FIND_MAX_HITS]
+        # children：每个匹配目录下真实存在的一级子目录（结构性事实，确定性列出）。
+        # LLM 据此做语义判断（如「前端」该选哪个），只能从这些真实项里选，不能凭空造路径。
+        children = {p: c for p in kept if (c := _immediate_children(p))}
+        return {"query": query, "root": root, "matches": kept, "children": children}
 
     return Tool("find_repo", _FIND_DESC, _find)
 
