@@ -3,5 +3,9 @@
 python-dotenv>=1.0
 openai>=1.0
 
+# 多语言扫描（可选）：装了才能扫 Python 以外的语言（JS/TS/Go/...）。
+# 没装时仅 Python 可扫，其它语言在 check_language_support 里显示为 extendable。
+# tree-sitter-language-pack>=0.9
+
 # 开发/测试
 pytest>=7.0

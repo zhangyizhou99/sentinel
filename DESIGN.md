@@ -93,6 +93,20 @@ flowchart TB
 
 ---
 
+### 2.1 自扩展多语言扫描（tree-sitter，已落地）
+
+目标：agent 自己判断仓库是什么语言 → 检查自己有没有对应解析器 → 没有就（人审后）**补齐**。
+
+- **确定性解析**：Python 用标准库 `ast`；其它语言用 tree-sitter（`tree-sitter-language-pack`，一次装齐多数语法）。每文件解析是确定性的，无 LLM。
+- **缺口检测**（只读，免授权）：`scanners/catalog.py` 按扩展名把仓库分成 supported / extendable / unknown。工具 `check_language_support`。
+- **查询三级来源**（`scanners/query_provider.py`）：内置（JS/TS/TSX 手写并三语法验证）→ 缓存 → **LLM 现写**。LLM 只负责「为新语言写 functions/calls 查询」这一件事，且用真语法**编译校验**（`compile_ok`）挡幻觉——编译不过就把报错回灌重试，通过才缓存复用。
+- **通用解析器**（`scanners/treesitter_scanner.py`）：`TreeSitterScanner` 由「语言名 + 查询」驱动，用 `@fn/@name/@callee` 抽函数/签名/起止行/调用点，产出统一 `CodeUnit`。是否埋点/命中信号复用跨语言共享判据（`scanners/instrumentation.py` + `scan.OBS_SIGNALS`）。
+- **人审门**：补齐是破坏性动作（可能 pip 安装 + LLM 写查询），工具 `install_language_support` 要求「用户在对话中明确同意后才可调用」。
+- **约定捕获名**：`@fn` 整个函数节点、`@name` 函数名、`@callee` 调用被调方。
+- 新增一门语言 = 注册一个 `TreeSitterScanner` 实例，下游（盲区/RAG/判定）一行不改。
+
+---
+
 ## 3. 第一次读代码：数据清洗与存储
 
 **流程**：`原始仓库 → 解析 → 清洗 → 切块 → 结构化元数据 → (向量化) → 落库`
@@ -136,7 +150,7 @@ flowchart TB
 |---|---|---|
 | **AST 函数级切块** ✅ | 选（第一期） | 代码有天然边界；一个函数 = 一个可观测性决策单位；召回精准 |
 | 固定窗口切块 | 弃 | 会把一个函数腰斩，语义破碎，检索噪声大 |
-| tree-sitter 多语言 | 二期 | 支持非 Python；`ast` 先覆盖 Python |
+| tree-sitter 多语言 ✅ | 已落地（§2.1） | 自扩展：检测缺口→人审→装 language-pack+LLM 写查询（编译校验）→通用解析 |
 
 **工具**：第一期 Python `ast`（stdlib）。切块产物即 §3.2 的 `CodeUnit`。
 **教学呼应**：第8章「切块」——我们用**语义切块**而非字符切块，面试可讲「为什么代码 RAG 不能用滑动窗口」。
@@ -177,6 +191,8 @@ VectorStore(port)  ← 上层只认接口
 |---|---|---|---|
 | `find_repo` | 关键词 → 工作区内匹配目录的绝对路径列表（只列名，不读内容） | 否 | 2/14 |
 | `scan` | repo → CodeUnit 列表 + 缺埋点清单（**读代码内容，需授权门**） | 否 | 2 |
+| `check_language_support` | repo → 语言覆盖缺口（supported/extendable/unknown，只看扩展名） | 否 | 2.1 |
+| `install_language_support` | 语言名 → 补齐 tree-sitter 解析能力（**可 pip 安装+LLM 写查询，须人审**） | **是** | 2.1 |
 | `retrieve` | query → top-K 相关代码单元（含证据） | 否 | 8 |
 | `judge_intent` | 代码单元 + 上下文 → 是否重要/该打什么点 + 置信度 + 引用 | 否 | 4/9 |
 | `gen_alert` | 指标 → PromQL/KQL 告警规则（含分级 Sev） | 否 | — |
@@ -394,7 +410,7 @@ flowchart LR
 - [ ] 代码注释是否也要中英双语（还是仅 Prompt 双语）？—— 待确认
 - [x] 隐私档：**不做可选隐私**，改为「一条默认路径 + VectorStore 抽象」（§5）。
 - [x] 向量库：默认**本地嵌入式**，生产可切自建 Qdrant/pgvector；具体生产选型待用到再定。
-- [ ] 多语言支持（tree-sitter）排期。
+- [x] 多语言支持（tree-sitter）：自扩展扫描已落地（§2.1，JS/TS 内置，冷门语言 LLM 现写+编译校验）。
 - [ ] 驾驶舱前端形态（Gradio / 其他）。
 - [ ] `.sentinel/ignore.yaml` 的确切 schema。
 - [ ] Baseline 的定义来源（纯知识库规则 / 可学习 / 团队自定义）。

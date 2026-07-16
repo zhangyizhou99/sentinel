@@ -11,13 +11,7 @@ from typing import Dict, List, Optional
 
 from sentinel.model.code_unit import CodeUnit
 from sentinel.scanners.base import LanguageScanner, register
-
-# 「函数体里出现这些子串」→ 认为已埋点（Python 生态）。
-INSTRUMENTATION_HINTS = (
-    "logger", "logging", "getlogger", ".log(", "log.info", "log.error",
-    "metrics", "meter", "counter", "histogram",
-    "tracer", "span", "otel", "opentelemetry", "statsd", "prometheus",
-)
+from sentinel.scanners.instrumentation import INSTRUMENTATION_HINTS  # 埋点判据现为跨语言共享
 
 # 用于别名解析：右侧点号名含这些子串就认为是可观测性依赖（与 OBS_SIGNALS 的 key 一致即可）。
 _DEP_KEYS = (

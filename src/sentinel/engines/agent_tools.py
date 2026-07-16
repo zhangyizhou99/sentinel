@@ -41,6 +41,17 @@ _SCAN_DESC = (
     "path to the user and ask for consent."
 )
 
+_CHECK_LANG_DESC = (
+    "check_language_support(仓库路径) — 检查仓库里都有哪些语言，以及 Sentinel 当前能不能扫。"
+    "返回三类：supported（已能扫）、extendable（认识但还没装解析器、可人审后补齐）、"
+    "unknown（不认识的扩展名）。只看文件名/扩展名，不读内容，无需授权。"
+    "当扫描前想确认覆盖面、或 scan 结果疑似漏了某语言时用它。 | "
+    "check_language_support(repo_path) — Report which languages a repo contains and whether "
+    "Sentinel can scan them: supported (ready), extendable (known but no parser installed yet — "
+    "can be added after user consent), unknown (unrecognized extensions). Reads file names only, "
+    "no contents, no permission needed. Use it to confirm coverage before/after a scan."
+)
+
 # 单次汇报的盲区上限，避免把超大仓库的结果整个塞进 LLM 上下文（容错 · DESIGN §13）。
 _MAX_REPORTED = 30
 # find_repo 限制：搜索深度与返回条数，避免在大目录树里跑飞。
@@ -136,3 +147,71 @@ def build_scan_tool(broker: Optional[PermissionBroker] = None) -> Tool:
         }
 
     return Tool("scan", _SCAN_DESC, _scan)
+
+
+# ---- check_language_support：报告语言覆盖面与缺口（只读，免授权）--------------
+
+def build_check_language_tool(broker: Optional[PermissionBroker] = None) -> Tool:
+    """构造 check_language_support 工具：报告仓库语言与是否可扫。
+
+    只看扩展名（不读内容），风险低。broker 存在时仅做越界检查，不需授权。
+    extendable 语言表示「认识但还没装解析器」——补齐动作（install_language_support）
+    是破坏性的，必须经人审门（Web 按钮），本工具只做只读的检测与提示。
+    """
+    from sentinel.scanners.catalog import analyze_repo
+
+    def _check(path: str) -> Dict[str, Any]:
+        p = _clean(path)
+        if not p:
+            raise ValueError("需要仓库路径 | repo path required")
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"路径不存在 | path not found: {p}")
+        if broker is not None and not broker.within_scope(p):
+            return {"denied": os.path.abspath(p),
+                    "reason": "超出允许的工作区范围 | out of allowed workspace"}
+
+        gap = analyze_repo(p)
+        return {
+            "repo": p,
+            "supported": gap.supported,     # 语言 → 文件数（已能扫）
+            "extendable": gap.extendable,   # 语言 → 文件数（可人审后补齐）
+            "unknown": gap.unknown,         # 扩展名 → 文件数（不认识）
+            "needs_extension": gap.needs_extension,
+            "hint": ("检测到可补齐的语言，可在获得用户同意后调用 install_language_support 补齐 | "
+                     "extendable languages found; call install_language_support after user consent")
+            if gap.needs_extension else "",
+        }
+
+    return Tool("check_language_support", _CHECK_LANG_DESC, _check)
+
+
+# ---- install_language_support：补齐某语言解析能力（破坏性 · 人审门）-----------
+
+_INSTALL_LANG_DESC = (
+    "install_language_support(语言名) — 给 Sentinel 补上某门语言的解析能力（tree-sitter）。"
+    "**这是破坏性操作**：可能 pip 安装依赖、并让 LLM 现写解析查询。"
+    "⚠️ 只有在用户于对话中**明确同意补齐该语言**后才可调用；不要自作主张。"
+    "先用 check_language_support 找出 extendable 语言，向用户说明并征得同意，再调用本工具。"
+    "输入：语言名（如 go、java、typescript）。成功后即可 scan 该语言文件。 | "
+    "install_language_support(language) — Add parsing support for a language (tree-sitter). "
+    "**Destructive**: may pip-install deps and have the LLM author a parser query. "
+    "⚠️ Call ONLY after the user has EXPLICITLY consented to adding this language. "
+    "Use check_language_support first, explain the gap, get consent, then call this. "
+    "Input: language name (e.g. go, java, typescript)."
+)
+
+
+def build_install_language_tool(llm=None) -> Tool:
+    """构造 install_language_support 工具。破坏性，靠描述约束「用户明确同意后才调」。
+
+    llm 用于给没有内置/缓存查询的冷门语言现写查询（编译校验兜底）。
+    """
+    from sentinel.scanners.treesitter_scanner import install_language_support
+
+    def _install(language: str) -> Dict[str, Any]:
+        lang = _clean(language).lower()
+        if not lang:
+            raise ValueError("需要语言名 | language name required")
+        return install_language_support(lang, llm=llm)
+
+    return Tool("install_language_support", _INSTALL_LANG_DESC, _install)

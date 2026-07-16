@@ -37,7 +37,12 @@ except Exception:  # noqa: BLE001
 
 from sentinel.config import workspace_root
 from sentinel.engines.agent import AgentCore, AgentRun
-from sentinel.engines.agent_tools import build_find_repo_tool, build_scan_tool
+from sentinel.engines.agent_tools import (
+    build_find_repo_tool,
+    build_scan_tool,
+    build_check_language_tool,
+    build_install_language_tool,
+)
 from sentinel.engines.scan import scan_repo, signals_of
 from sentinel.engines.judge import judge_intent, _peers
 from sentinel.engines.knowledge import knowledge_for
@@ -74,10 +79,13 @@ def _is_open_authorized(ap: str) -> bool:
 
 
 def _build_agent(broker: PermissionBroker) -> AgentCore:
-    """构造带 find_repo + scan 两个工具的 agent（都受该会话的权限门约束）。"""
+    """构造带 find_repo + scan + 语言能力检测/补齐 四个工具的 agent（均受该会话权限门约束）。"""
     find = build_find_repo_tool(broker)
     scan = build_scan_tool(broker)
-    return AgentCore(_LLM, tools={find.name: find, scan.name: scan})
+    check = build_check_language_tool(broker)             # 只读：报告语言覆盖缺口
+    install = build_install_language_tool(_LLM)           # 破坏性：须用户明确同意后才补齐
+    tools = {t.name: t for t in (find, scan, check, install)}
+    return AgentCore(_LLM, tools=tools)
 
 
 # -- 回复格式化 ------------------------------------------------------------
