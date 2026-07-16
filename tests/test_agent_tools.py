@@ -28,6 +28,19 @@ def test_scan_tool_missing_path_raises():
     tool = build_scan_tool()
     with pytest.raises(FileNotFoundError):
         tool.func("/no/such/path/xyz")
+
+
+def test_scan_tool_reports_language_gap(tmp_path):
+    """混合仓库：.py 能扫，.go 没装解析器 → report 要显式带 language_gap，不能静默吞掉。
+
+    用 .go（全程序里没有任何测试会注册它）而非 .ts，避免与 test_multilang 的全局
+    解析器注册（进程内共享 _REGISTRY）产生测试顺序耦合。
+    """
+    (tmp_path / "a.py").write_text("def f():\n    import redis\n    redis.Redis().get('k')\n")
+    (tmp_path / "b.go").write_text("package main\nfunc g() {}\n")
+    tool = build_scan_tool()
+    report = tool.func(str(tmp_path))
+    assert report.get("language_gap") == {"go": 1}
     with pytest.raises(ValueError):
         tool.func("")
 

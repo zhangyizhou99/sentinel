@@ -33,12 +33,16 @@ _SCAN_DESC = (
     "scan(仓库路径) — 扫描代码仓库，找出可观测性盲区：调用了外部依赖"
     "（缓存/数据库/HTTP/队列等）却没有任何日志/指标/追踪的函数。"
     "输入：仓库的绝对路径（可先用 find_repo 得到）。会读取文件内容，需先获得授权；"
-    "若未授权，返回 permission_required，请把该路径告知用户并请求同意。 | "
+    "若未授权，返回 permission_required，请把该路径告知用户并请求同意。"
+    "返回里若有 language_gap，说明部分文件因为还没装对应语言的解析器而被跳过——"
+    "请把这个缺口告诉用户，并在用户同意后调用 install_language_support 补齐、再重新 scan。 | "
     "scan(repo_path) — Scan a code repository to find observability blind spots: functions that "
     "call external dependencies (cache/db/http/queue/...) but have no logging/metrics/tracing. "
     "Input: absolute repo path (use find_repo first if needed). Reads file contents, so it "
     "requires prior authorization; if not authorized it returns permission_required — relay the "
-    "path to the user and ask for consent."
+    "path to the user and ask for consent. If the result has language_gap, some files were "
+    "skipped because no parser is installed for their language yet — tell the user, and after "
+    "consent call install_language_support then re-scan."
 )
 
 _CHECK_LANG_DESC = (
@@ -159,6 +163,15 @@ def build_scan_tool(broker: Optional[PermissionBroker] = None, memory=None) -> T
                 for u in spots[:_MAX_REPORTED]
             ],
         }
+        # 语言缺口可见性：有些文件因为没装对应解析器被**静默跳过**——这里显式报出来，
+        # 别让用户以为"扫完了/没盲区"，其实一大块代码根本没被看过。
+        try:
+            from sentinel.scanners.catalog import analyze_repo
+            gap = analyze_repo(p)
+            if gap.extendable:
+                report["language_gap"] = dict(gap.extendable)  # 语言 → 文件数（可补齐）
+        except Exception:  # noqa: BLE001  语言缺口检测失败不影响扫描主结果
+            pass
         if memory is not None:
             memory.record_run(p, blind_spot_count=len(spots), suppressed_count=suppressed)
         return report

@@ -162,6 +162,17 @@ def _open_in_editor(path: str, line: int) -> None:
         pass
 
 
+def _language_gap_note(data: dict) -> str:
+    """语言缺口提示：有文件因未装解析器被静默跳过时，显式告诉用户（别让人以为扫全了）。"""
+    gap = data.get("language_gap") or {}
+    if not gap:
+        return ""
+    items = "、".join(f"{lang}({n} 个文件)" for lang, n in gap.items())
+    return (f"\n\n⚠️ **另有未扫描的文件**：{items} —— 因为还没安装对应语言的解析器，"
+            f"这些文件被跳过、**不在上面的盲区统计里**。"
+            f"回复「装上 <语言>」或直接说「补齐」，我会在你同意后安装并重新扫描。")
+
+
 def _render_report(data: dict) -> str:
     """把一份 scan 报告渲染成易读表格；文件名做成可点击的 VS Code 深链。"""
     spots = data.get("blind_spots", [])
@@ -170,15 +181,16 @@ def _render_report(data: dict) -> str:
     supp_note = f"（已抑制 **{suppressed}** 个你此前标记忽略的函数）" if suppressed else ""
     head = (f"扫描 `{repo or '?'}`：共 **{data.get('total_units', '?')}** 个函数，"
             f"发现 **{data.get('blind_spot_count', len(spots))}** 个监控盲区{supp_note}。")
+    gap_note = _language_gap_note(data)
     if not spots:
-        return head + "\n\n✅ 没有明显盲区。"
+        return head + "\n\n✅ 没有明显盲区。" + gap_note
     rows = ["| 文件（点击在 VS Code 打开） | 函数 | 风险信号 | 行 |", "| --- | --- | --- | --- |"]
     for b in spots:
         sig = ", ".join(b.get("signals", [])) or "-"
         link = _open_link(repo, b.get("file", ""), b.get("lines", ""))
         file_cell = f"[{b.get('file', '?')}]({link})"
         rows.append(f"| {file_cell} | `{b.get('function', '?')}` | {sig} | {b.get('lines', '?')} |")
-    return head + "\n\n" + "\n".join(rows)
+    return head + "\n\n" + "\n".join(rows) + gap_note
 
 
 def _clip(text, n: int = 180) -> str:
@@ -774,6 +786,22 @@ def run(host: str = "127.0.0.1", port: int = 7860) -> None:
         _open_in_editor(path, line)
         # 204 No Content：点链接后浏览器不跳转、对话不丢，只默默打开编辑器。
         return Response(status_code=204)
+
+    @app.on_event("startup")
+    def _warm_up() -> None:
+        """后台预热 embedder（首次会下载 ONNX 模型，同步做的话会卡住用户第一次点击）。
+
+        放进后台线程、不阻塞服务启动；判定时若还没预热完，_get_embedder() 会自己再等。
+        """
+        import threading
+
+        def _warm():
+            try:
+                _get_embedder().embed_one("warm up")
+            except Exception:  # noqa: BLE001  预热失败不影响服务；真正用到时会再报错
+                pass
+
+        threading.Thread(target=_warm, daemon=True).start()
 
     app = gr.mount_gradio_app(app, build_demo(), path="/")
     uvicorn.run(app, host=host, port=port)
