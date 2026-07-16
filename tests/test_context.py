@@ -192,3 +192,13 @@ def test_unit_providers_safe_without_unit():
     b = default_turn_builder(notes=None).build(t)
     assert all(s.source != "target" for s in b.sections)
 
+
+def test_global_note_recalled_without_repo():
+    """全局笔记（身份/跨仓库约定）在没有 repo 的对话里也要被召回（重启不忘）。"""
+    ns = _notes()
+    ns.add_note("我是主要负责人 jiojio", repo=None)          # 全局笔记（repo 空）
+    ctx = default_turn_builder(notes=ns).build(
+        ContextTarget(repo="", turns=[("user", "你好")]))     # 尚未扫描任何仓库
+    assert "jiojio" in ctx.text
+    ns.close()
+

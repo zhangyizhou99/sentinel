@@ -304,8 +304,10 @@ class NoteProvider(EvidenceProvider):
         self.max_notes = max_notes
 
     def provide(self, target: ContextTarget) -> List[ContextSection]:
-        if self.notes is None or not target.repo:
+        if self.notes is None:
             return []
+        # 注意：不要因 repo 为空就 return——全局笔记（如「我是负责人 jiojio」这类身份/跨仓库约定）
+        # 必须在任何对话里都能被召回（search_notes 对空 repo 会返回全局笔记）。
         hits = self.notes.search_notes(
             repo=target.repo, unit_id=target.unit_id,
             tags=target.signals, limit=self.max_notes,
