@@ -128,6 +128,79 @@ def _render_report(data: dict) -> str:
     return head + "\n\n" + "\n".join(rows)
 
 
+def _clip(text, n: int = 180) -> str:
+    """截断长文本，便于在轨迹里展示。"""
+    text = str(text or "").strip().replace("\n", " ")
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def _summarize_obs(obs) -> str:
+    """把一次工具观测压成一句人话（便于学习，不刷屏）。"""
+    if not isinstance(obs, dict):
+        return _clip(obs)
+    if "error" in obs:
+        return f"⚠️ {_clip(obs['error'])}"
+    res = obs.get("result", obs)
+    if isinstance(res, dict):
+        if "blind_spots" in res:
+            return (f"扫描 → 共 {res.get('total_units', '?')} 个函数，"
+                    f"{res.get('blind_spot_count', '?')} 个盲区")
+        if "matches" in res:
+            ms = res.get("matches", [])
+            names = ", ".join(os.path.basename(m) for m in ms[:3])
+            return f"找到 {len(ms)} 个匹配" + (f"：{names}" if names else "")
+        if res.get("permission_required"):
+            return f"🔐 需授权：{res['permission_required']}"
+        if res.get("denied"):
+            return "⛔ 越界，拒绝访问"
+    return _clip(res)
+
+
+def _format_trace(run: AgentRun) -> str:
+    """把一次自治运行渲染成「三范式」可读轨迹，供学习：Plan → ReAct → Reflection。"""
+    L: List[str] = []
+
+    # ① Plan-and-Execute：动手前先把目标拆成有序计划。
+    if run.plan:
+        L.append("**① Plan-and-Execute · 计划**（动手前先拆解目标）")
+        for i, s in enumerate(run.plan, 1):
+            L.append(f"{i}. 用 `{s.get('tool', '?')}` — {s.get('why', '')}")
+        L.append("")
+
+    # ② ReAct：Thought → Action → Observation 循环，真正调用工具。
+    L.append("**② ReAct · 执行**（想 Thought → 做 Action → 看 Observation）")
+    if not run.transcript:
+        L.append("- （无）")
+    for item in run.transcript:
+        t = item.get("type")
+        if t == "thought":
+            L.append(f"- 💭 **想**：{_clip(item.get('content', ''))}")
+        elif t == "action":
+            L.append(f"- 🔧 **做**：`{item.get('tool')}[{_clip(item.get('input', ''), 60)}]`")
+            L.append(f"    ↳ 👀 **看**：{_summarize_obs(item.get('observation', {}))}")
+        elif t == "finish":
+            L.append(f"- 🏁 **收**：{_clip(item.get('content', ''), 200)}")
+    L.append("")
+
+    # ③ Reflection：行动后自评是否达标，不达标则重规划。
+    if run.reflections:
+        L.append("**③ Reflection · 反思**（自评达标了吗，不达标就重规划）")
+        for i, v in enumerate(run.reflections, 1):
+            done = "✅ 达标" if v.get("complete") else "↻ 继续"
+            extra = ""
+            if v.get("missing"):
+                extra += f"，缺口：{'; '.join(map(str, v.get('missing', [])))}"
+            if v.get("next"):
+                extra += f"，下一步：{_clip(v.get('next'), 60)}"
+            L.append(f"- 第 {i} 轮：{done}，打分 {v.get('score', '?')}/10{extra}")
+
+    if run.failures:
+        L.append("")
+        L.append(f"**⚠️ 失败记录**：{len(run.failures)} 条（容错：记录但不阻断整体）")
+
+    return "\n".join(L)
+
+
 def _format_run(run: AgentRun) -> str:
     """把一次 agent 自治运行渲染成对话回复：结论 + 可展开的过程。"""
     parts: List[str] = []
@@ -144,22 +217,13 @@ def _format_run(run: AgentRun) -> str:
     elif not reports:
         parts.append(ans or "（没有得到结论）")
 
-    # 过程：计划 + 每次工具调用的观测（透明可审计）。
-    trace_lines: List[str] = []
-    if run.plan:
-        steps = " → ".join(f"{s.get('tool', '?')}" for s in run.plan)
-        trace_lines.append(f"**计划**：{steps}")
-    for item in run.transcript:
-        if item.get("type") == "action":
-            obs = item.get("observation", {})
-            if "error" in obs:
-                trace_lines.append(f"- `{item['tool']}[{item['input']}]` → ⚠️ {obs['error']}")
-            else:
-                trace_lines.append(f"- `{item['tool']}[{item['input']}]` ✓")
-
-    if trace_lines:
-        body = "\n".join(trace_lines)
-        parts.append(f"\n<details><summary>🔎 过程（{run.rounds} 轮）</summary>\n\n{body}\n</details>")
+    # 3) 学习层：完整的三范式执行轨迹，可展开（Plan → ReAct → Reflection）。
+    trace = _format_trace(run)
+    if trace.strip():
+        parts.append(
+            f"\n<details><summary>🔎 Agent 执行轨迹 · 三范式（{run.rounds} 轮，点击展开）</summary>"
+            f"\n\n{trace}\n</details>"
+        )
     return "\n".join(parts)
 
 
