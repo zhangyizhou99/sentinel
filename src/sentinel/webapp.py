@@ -39,11 +39,25 @@ from sentinel.config import workspace_root
 from sentinel.engines.agent import AgentCore, AgentRun
 from sentinel.engines.agent_tools import build_find_repo_tool, build_scan_tool
 from sentinel.engines.scan import scan_repo, signals_of
+from sentinel.engines.judge import judge_intent, _peers
+from sentinel.engines.knowledge import knowledge_for
+from sentinel.cognition import CodeIndex
 from sentinel.llm import LLMClient
 from sentinel.permissions import PermissionBroker
 
 # 全局单例：LLM 客户端（无 key 时 available=False，走降级路径，不崩）。
 _LLM = LLMClient()
+
+# 意图判定用的向量索引 embedder 单例（避免每条消息重载模型）。
+_EMBEDDER = None
+
+
+def _get_embedder():
+    global _EMBEDDER
+    if _EMBEDDER is None:
+        from sentinel.cognition import FastEmbedEmbedder
+        _EMBEDDER = FastEmbedEmbedder()
+    return _EMBEDDER
 
 # 已授权可「打开文件」的路径集合（服务端级）。与 scan 授权一致：只有用户
 # 同意扫描过（或降级模式下显式发起扫描）的目录，其文件才允许被 /open 打开。
@@ -201,27 +215,92 @@ def _format_trace(run: AgentRun) -> str:
     return "\n".join(L)
 
 
+def _judge_section(run: AgentRun):
+    """对扫出的盲区逐个跑 judge_intent，返回 (主回复建议, 轨迹④证据) 两段 markdown。
+
+    这一步把「RAG 检索 + 上下文工程 + LLM 语义判定」串起来并展示出来。
+    为控延迟/成本，最多判定 _JUDGE_CAP 个盲区。
+    """
+    _JUDGE_CAP = 5
+    reports = _scan_reports(run)
+    main: List[str] = []
+    trace: List[str] = []
+    judged = 0
+    for rep in reports:
+        repo = rep.get("repo")
+        spots = rep.get("blind_spots", [])
+        if not repo or not spots:
+            continue
+        try:
+            units = scan_repo(repo).units          # 拿到完整 CodeUnit（judge 需要 calls 等）
+        except Exception:  # noqa: BLE001
+            continue
+        by_id = {u.unit_id: u for u in units}
+        index = CodeIndex(embedder=_get_embedder())  # 建索引供 RAG 召回相似已埋点函数
+        index.index(units)
+        for b in spots:
+            if judged >= _JUDGE_CAP:
+                break
+            unit = by_id.get(f"{b.get('file')}::{b.get('function')}")
+            if unit is None:
+                continue
+            v = judge_intent(unit, index, _LLM)
+            judged += 1
+            sigs = ", ".join(signals_of(unit)) or "-"
+
+            # 主回复：给「该埋什么」的建议
+            verb = "建议 **埋点**" if v.verdict == "instrument" else "可跳过"
+            flag = {"uncertain": " ⚠️存疑", "llm_unavailable": " （无 LLM·通用建议）",
+                    "parse_error": " ⚠️解析失败"}.get(v.status, "")
+            main.append(f"- **`{unit.qualname}`** [{sigs}] → {verb}（置信 {v.confidence:.1f}{flag}）")
+            for s in v.suggestions[:4]:
+                main.append(f"    - {s.get('type', '?')}: {s.get('what', '')}")
+            if v.evidence:
+                main.append(f"    - 依据：{', '.join(map(str, v.evidence[:4]))}")
+
+            # 轨迹④：展示 RAG 召回了哪些证据
+            peers = _peers(unit, index)
+            peer_names = ", ".join(p.get("qualname", "?") for p in peers) or "无"
+            know = ", ".join(knowledge_for(signals_of(unit)).keys()) or "无"
+            trace.append(
+                f"- `{unit.qualname}`：RAG 召回 **{len(peers)}** 个已埋点相似函数（{peer_names}）"
+                f"；RED/USE 知识：{know} → 判定 **{v.verdict}** / {v.confidence:.1f}"
+            )
+
+    main_md = ("### 🧠 意图判定（该埋什么）\n" + "\n".join(main)) if main else ""
+    trace_md = ("**④ RAG + Judge · 意图判定**（检索证据 → 拼上下文 → LLM 判定）\n"
+                + "\n".join(trace)) if trace else ""
+    return main_md, trace_md
+
+
 def _format_run(run: AgentRun) -> str:
-    """把一次 agent 自治运行渲染成对话回复：结论 + 可展开的过程。"""
+    """把一次 agent 自治运行渲染成对话回复：结论 + 判定建议 + 可展开的过程。"""
     parts: List[str] = []
 
-    # 1) 事实层：用工具真实观测渲染盲区表（ground truth）。
+    # 1) 事实层：盲区表（ground truth）。
     reports = _scan_reports(run)
     if reports:
         parts.append("\n\n".join(_render_report(r) for r in reports))
 
-    # 2) 解读层：LLM 的自然语言结论，仅当它是散文（非 JSON 改写）才展示，避免与表格重复。
+    # 2) 判定层：对盲区逐个判定「该埋什么」（RAG + 上下文 + LLM）。
+    judge_main, judge_trace = _judge_section(run)
+    if judge_main:
+        parts.append(judge_main)
+
+    # 3) 解读层：LLM 的自然语言结论（仅散文，避免与表格重复）。
     ans = (run.answer or "").strip()
     if ans and not ans.startswith("{"):
         parts.append("💬 " + ans)
-    elif not reports:
+    elif not reports and not judge_main:
         parts.append(ans or "（没有得到结论）")
 
-    # 3) 学习层：完整的三范式执行轨迹，可展开（Plan → ReAct → Reflection）。
+    # 4) 学习层：三范式执行轨迹 + RAG/判定证据，可展开。
     trace = _format_trace(run)
+    if judge_trace:
+        trace = trace + "\n\n" + judge_trace
     if trace.strip():
         parts.append(
-            f"\n<details><summary>🔎 Agent 执行轨迹 · 三范式（{run.rounds} 轮，点击展开）</summary>"
+            f"\n<details><summary>🔎 Agent 执行轨迹 · 三范式 + RAG/判定（{run.rounds} 轮，点击展开）</summary>"
             f"\n\n{trace}\n</details>"
         )
     return "\n".join(parts)
