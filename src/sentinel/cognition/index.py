@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from sentinel.model.code_unit import CodeUnit
 from sentinel.cognition.embedder import Embedder, default_embedder, embedding_text
@@ -64,10 +64,19 @@ class CodeIndex:
         self.store.add(ids, vectors, payloads)
         return len(units)
 
-    def retrieve(self, query: str, k: int = 5) -> List[RetrievedUnit]:
-        """给一个自然语言问题，召回最相关的 top-K 代码单元。"""
+    def retrieve(self, query: str, k: int = 5,
+                 predicate: Optional[Callable[[Dict[str, Any]], bool]] = None) -> List[RetrievedUnit]:
+        """给一个自然语言问题，召回最相关的 top-K 代码单元。
+
+        predicate：可选的 payload 过滤器（如「只要已埋点的」）。有过滤时先多取一批
+        （pool）再过滤，避免过滤后不足 K 个。
+        """
         qvec = self.embedder.embed_one(query)
-        hits: List[Hit] = self.store.search(qvec, k=k)
+        pool = k if predicate is None else max(k * 6, 30)
+        hits: List[Hit] = self.store.search(qvec, k=pool)
+        if predicate is not None:
+            hits = [h for h in hits if predicate(h.payload)]
+        hits = hits[:k]
         return [RetrievedUnit(score=h.score, payload=h.payload) for h in hits]
 
     def count(self) -> int:
