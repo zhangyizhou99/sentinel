@@ -79,3 +79,17 @@ def test_apply_records_reusable_skill():
     Applier().apply(str(d), blind, "sk", procedural=pm)
     # checkin 触及 redis(cache) → 记录 (python, cache) 修复技能，供同类盲区复用
     assert pm.get_skill("python", "cache") is not None
+
+
+def test_apply_tool_proposes_without_editing():
+    """apply 工具是提议器：产出提议 + 建议分支名，但绝不直接改代码。"""
+    from sentinel.engines.agent_tools import build_apply_tool
+    d = Path(tempfile.mkdtemp())
+    src = "def checkin():\n    return redis.get('k')\n"
+    (d / "svc.py").write_text(src)
+    out = build_apply_tool().func(str(d))
+    prop = out["proposed_apply"]
+    assert prop["count"] == 1
+    assert any("checkin" in u for u in prop["unit_ids"])
+    assert prop["suggested_branch"].startswith("sentinel/instrument-")
+    assert (d / "svc.py").read_text() == src            # 关键：没改代码

@@ -45,6 +45,7 @@ from sentinel.engines.agent_tools import (
     build_feedback_tool,
     build_note_tool,
     build_recall_notes_tool,
+    build_apply_tool,
 )
 from sentinel.engines.scan import scan_repo, signals_of
 from sentinel.engines.judge import judge_intent
@@ -76,6 +77,17 @@ def _get_notes():
         from sentinel.memory import NoteStore
         _NOTES = NoteStore()
     return _NOTES
+
+# 程序性记忆单例（修复技能：补埋点时复用/记录）。
+_PROCEDURAL = None
+
+
+def _get_procedural():
+    global _PROCEDURAL
+    if _PROCEDURAL is None:
+        from sentinel.memory import ProceduralMemory
+        _PROCEDURAL = ProceduralMemory()
+    return _PROCEDURAL
 
 # 意图判定用的向量索引 embedder 单例（避免每条消息重载模型）。
 _EMBEDDER = None
@@ -113,7 +125,8 @@ def _build_agent(broker: PermissionBroker) -> AgentCore:
     ignore = build_feedback_tool(mem)                     # 反馈学习：标为不用埋点→下次抑制
     add_note = build_note_tool(notes, mem)               # 记团队笔记 → 判定上下文一等证据
     recall = build_recall_notes_tool(notes, mem)         # 查团队笔记
-    tools = {t.name: t for t in (find, scan, check, install, ignore, add_note, recall)}
+    apply = build_apply_tool(broker, memory=mem)         # 破坏性提议器：只提议补埋点，执行走 UI 人审门
+    tools = {t.name: t for t in (find, scan, check, install, ignore, add_note, recall, apply)}
     return AgentCore(_LLM, tools=tools)
 
 
@@ -542,6 +555,7 @@ def _ensure(state) -> dict:
         state["pending"] = []
         state["candidates"] = []
         state["goal"] = None
+    state.setdefault("pending_apply", None)
     return state
 
 
@@ -602,6 +616,61 @@ def _recent_context(chat, state: dict, max_turns: int = 4) -> str:
     return ctx.text
 
 
+def _collect_apply_proposal(run):
+    """从 transcript 取 apply_instrumentation 工具的补埋点提议（若有）。"""
+    for item in run.transcript:
+        if item.get("type") == "action" and item.get("tool") == "apply_instrumentation":
+            res = (item.get("observation") or {}).get("result", {})
+            if isinstance(res, dict) and res.get("proposed_apply"):
+                return res["proposed_apply"]
+    return None
+
+
+def _extract_branch(msg: str) -> str:
+    """从用户消息里抽出分支名（如 fix/obs、sentinel-x）；抽不到返回空。"""
+    m = re.findall(r"[A-Za-z][\w./\-]*", msg or "")
+    return m[-1] if m else ""
+
+
+def _do_apply(repo: str, branch: str) -> str:
+    """真正执行补埋点：扫盲区→学约定→Applier 补到新分支（未提交）→回 diff。"""
+    from sentinel.engines.apply import Applier, ApplyError
+    from sentinel.engines.conventions import learn_convention
+    mem = _get_memory()
+    result = scan_repo(repo)
+    ignored = mem.ignored_units(repo)
+    spots = [u for u in result.blind_spots if u.unit_id not in ignored]
+    if not spots:
+        return "没有需要补埋点的盲区了。"
+    conv = learn_convention(repo, result.units)
+    try:
+        res = Applier().apply(repo, spots, branch, convention=conv, procedural=_get_procedural())
+    except ApplyError as e:
+        return (f"❌ 无法补埋点：{e}\n\n"
+                "（apply 需要一个干净的 git 仓库；想换分支名可以再说「补一下」并指定名字。）")
+    lines = [f"✅ {res.message}"]
+    if res.units_fixed:
+        lines.append(f"已补 {len(res.units_fixed)} 个：{', '.join(res.units_fixed)}")
+    if res.skipped:
+        lines.append(f"⏭ 跳过 {len(res.skipped)} 个（非 Python / 改写不安全）")
+    lines.append(f"\n```diff\n{(res.diff or '(无 diff)')[:2500]}\n```")
+    return "\n".join(lines)
+
+
+def _handle_apply_reply(state: dict, msg: str) -> str:
+    """处理用户对「分支名确认」的回应：取消 / 用建议名 / 用户指定名 → 执行或取消。"""
+    prop = state.get("pending_apply") or {}
+    state["pending_apply"] = None
+    if _is_negative(msg):
+        return "好的，已取消，不补埋点。"
+    branch = prop.get("suggested_branch", "")
+    if not _is_affirmative(msg):
+        branch = _extract_branch(msg) or branch
+    if not branch:
+        return "没拿到分支名，取消补埋点。"
+    return _do_apply(prop.get("repo", ""), branch)
+
+
 def _agent_turn(state: dict, goal: str, context: str = ""):
     """跑一次 agent，返回 (回复文本, 待授权路径, 候选路径)。
 
@@ -633,6 +702,12 @@ def _agent_turn(state: dict, goal: str, context: str = ""):
     denied = _collect(run, "denied")
     if denied:
         return _format_denied(denied, broker), [], []
+    proposal = _collect_apply_proposal(run)
+    if proposal:
+        state["pending_apply"] = proposal
+        return (f"🔧 建议对 **{proposal['count']} 个盲区**补埋点。\n\n"
+                f"分支名用 `{proposal['suggested_branch']}` 可以吗？回复「可以」就用它；"
+                f"或直接告诉我你想要的分支名（如 `fix/obs`）。"), [], []
     return _format_run(run), [], []
 
 
@@ -673,6 +748,13 @@ def _ui_bot(chat, state):
         return chat, *_controls(state.get("pending"), state.get("candidates")), \
             *_ignore_controls(state)
     msg = chat[-1]["content"]
+
+    # 有待确认的补埋点提议 → 这条消息当作「分支名确认/指定/取消」处理。
+    if state.get("pending_apply"):
+        reply = _handle_apply_reply(state, msg)
+        chat.append({"role": "assistant", "content": reply})
+        return chat, *_controls(state.get("pending"), state.get("candidates")), \
+            *_ignore_controls(state)
 
     # 有待授权时，也支持打字「同意/取消」（与按钮等效）。
     if state.get("pending") and _is_affirmative(msg):

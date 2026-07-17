@@ -215,6 +215,57 @@ def build_scan_tool(broker: Optional[PermissionBroker] = None, memory=None, note
     return Tool("scan", _SCAN_DESC, _scan)
 
 
+# ---- apply_instrumentation：提议给盲区补埋点（破坏性，但只提议不改代码）------------
+
+_APPLY_DESC = (
+    "apply_instrumentation(仓库路径或名) —— 【提议给盲区补埋点，破坏性，但**不直接改代码**】"
+    "对扫描出的盲区函数产出补埋点提议：返回「要补哪些函数 + 建议分支名」，"
+    "绝不直接改代码——真正改代码要用户在界面点「同意」后才执行。"
+    "仅当用户明确想补埋点 / 修复监控盲区时才调用；不确定给哪个仓库补就先扫描或问清。 | "
+    "apply_instrumentation(repo): propose instrumenting blind-spot functions. Returns a proposal "
+    "(which functions + suggested branch); NEVER edits code directly — edits happen only after "
+    "the user confirms in the UI."
+)
+
+
+def _suggest_branch(repo: str) -> str:
+    """给一个建议分支名：sentinel/instrument-<仓库名>（用户可在界面改）。"""
+    name = os.path.basename(os.path.abspath(repo).rstrip(os.sep)) or "repo"
+    return f"sentinel/instrument-{name}"
+
+
+def build_apply_tool(broker: Optional[PermissionBroker] = None, memory=None) -> Tool:
+    """构造 apply_instrumentation 工具（**提议器**：只产出补埋点提议，绝不直接改代码）。
+
+    破坏性执行由 UI 人审门接管——用户确认分支名后才真跑 Applier（DESIGN §8.3）。
+    因为本工具不改代码，agent 自治调用它是安全的：门在「执行」那一步，不在「提议」这一步。
+    """
+    def _propose(target: str) -> Dict[str, Any]:
+        p = _clean(target)
+        if not p and memory is not None:
+            p = memory.last_repo or ""
+        if not p:
+            return {"error": "不知道要给哪个仓库补埋点，请先扫描或指明仓库 | which repo?"}
+        if not os.path.exists(p):
+            return {"error": f"路径不存在 | path not found: {p}"}
+        if broker is not None and not broker.within_scope(p):
+            return {"denied": os.path.abspath(p), "reason": "超出允许的工作区范围 | out of workspace"}
+        result = scan_repo(p)
+        spots = result.blind_spots
+        if memory is not None:
+            ignored = memory.ignored_units(p)
+            spots = [u for u in spots if u.unit_id not in ignored]
+        if not spots:
+            return {"proposed_apply": None, "note": "没有需要补埋点的盲区（或都被标记忽略）"}
+        return {"proposed_apply": {
+            "repo": os.path.abspath(p),
+            "unit_ids": [u.unit_id for u in spots],
+            "count": len(spots),
+            "suggested_branch": _suggest_branch(p),
+        }}
+    return Tool("apply_instrumentation", _APPLY_DESC, _propose)
+
+
 # ---- check_language_support：报告语言覆盖面与缺口（只读，免授权）--------------
 
 def build_check_language_tool(broker: Optional[PermissionBroker] = None) -> Tool:
