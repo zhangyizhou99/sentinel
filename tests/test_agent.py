@@ -128,78 +128,109 @@ def test_reflect_bad_json_treated_complete():
     assert v["complete"] is True  # 防死循环
 
 
-# -- 编排：Plan -> Act -> Reflect (-> 重规划) --------------------------------
-
-def test_run_stops_when_good_enough():
-    llm = _StubLLM([
-        '[{"tool": "add", "why": "sum"}]',                          # plan
-        "Thought: 算\nAction: add[2, 3]",                           # act step 1
-        "Thought: 完成\nAction: Finish[5]",                         # act step 2
-        '{"score": 9, "complete": true, "missing": [], "next": ""}',  # reflect
-    ])
-    core = AgentCore(llm, max_rounds=2)
-    run = core.run("算 2+3")
-    assert run.rounds == 1
-    assert run.answer == "5"
-    assert run.reflections[-1]["complete"] is True
+# -- 编排：function calling 循环 --------------------------------------------
 
 
-def test_run_replans_then_stops():
-    llm = _StubLLM([
-        '[{"tool": "echo", "why": "hi"}]',                          # plan r1
-        "Thought: echo\nAction: echo[hi]",                          # act r1 s1
-        "Thought: done\nAction: Finish[hi]",                        # act r1 s2
-        '{"score": 4, "complete": false, "missing": ["需要求和"], "next": "用 add 求和"}',  # reflect r1
-        '[{"tool": "add", "why": "sum"}]',                          # replan r2
-        "Thought: 求和\nAction: add[2, 3]",                         # act r2 s1
-        "Thought: done\nAction: Finish[5]",                         # act r2 s2
-        '{"score": 9, "complete": true, "missing": [], "next": ""}',  # reflect r2
-    ])
-    core = AgentCore(llm, max_rounds=3)
-    run = core.run("先打招呼再算 2+3")
-    assert run.rounds == 2
-    assert len(run.reflections) == 2
-    assert run.reflections[0]["complete"] is False
-    assert run.reflections[1]["complete"] is True
+class _Msg:
+    """模拟 openai message 对象（含 content 与 tool_calls）。"""
+    def __init__(self, content=None, tool_calls=None):
+        self.content = content
+        self.tool_calls = tool_calls
 
 
-def test_context_flows_into_plan_and_act():
-    """会话背景应注入 plan 与 act 的系统提示，让多轮指代（如「把这个忽略」）能解析。"""
+def _tc(name, arguments, cid="c1"):
+    fn = type("F", (), {"name": name, "arguments": arguments})()
+    return type("TC", (), {"id": cid, "function": fn})()
+
+
+class _ChatStub:
+    """桩 LLM：chat() 按脚本返回 message；complete() 供 reflect 用。"""
+    available = True
+
+    def __init__(self, script):
+        self._script = list(script)
+        self.calls = 0
+
+    def chat(self, messages, tools=None):
+        self.calls += 1
+        return self._script.pop(0)
+
+    def complete(self, system, user):
+        return '{"score": 9, "complete": true, "missing": [], "next": ""}'
+
+
+def test_run_calls_tool_then_answers():
+    llm = _ChatStub([_Msg(tool_calls=[_tc("echo", '{"input": "hi"}')]),
+                     _Msg(content="完成了")])
+    core = AgentCore(llm, tools={"echo": Tool("echo", "回显", lambda s: s)})
+    run = core.run("echo hi")
+    assert run.answer == "完成了"
+    actions = [t for t in run.transcript if t["type"] == "action"]
+    assert actions[0]["tool"] == "echo"
+    assert actions[0]["observation"] == {"result": "hi"}
+    assert run.reflections and run.reflections[-1]["complete"] is True   # 有工具调用→反思
+
+
+def test_run_direct_answer_needs_no_tool():
+    llm = _ChatStub([_Msg(content="你是 jiojio，本项目负责人。")])
+    core = AgentCore(llm, tools={})
+    run = core.run("我是谁", context="[NOTES] 我是负责人jiojio")
+    assert "jiojio" in run.answer
+    assert run.reflections == []                        # 纯对话不反思
+    assert "无法解析动作" not in run.answer
+
+
+def test_run_tool_error_recorded_not_crash():
+    def boom(_):
+        raise ValueError("坏了")
+    llm = _ChatStub([_Msg(tool_calls=[_tc("boom", '{"input": "x"}')]),
+                     _Msg(content="出错了但我没崩")])
+    core = AgentCore(llm, tools={"boom": Tool("boom", "会抛错", boom)})
+    run = core.run("试试")
+    assert run.answer == "出错了但我没崩"
+    assert run.failures and "error" in run.failures[0]
+
+
+def test_run_respects_max_steps():
+    # 永远返回 tool_calls → 靠 max_steps 兜底停下。
+    script = [_Msg(tool_calls=[_tc("echo", f'{{"input": "{i}"}}')]) for i in range(20)]
+    core = AgentCore(_ChatStub(script), tools={"echo": Tool("echo", "e", lambda s: s)},
+                     max_steps=3)
+    run = core.run("停不下来")
+    assert "上限" in run.answer or "limit" in run.answer
+
+
+def test_run_semantic_arg_name():
+    # 工具用语义化参数名（path 而非 input）也能取到。
+    captured = {}
+
+    def scan(p):
+        captured["p"] = p
+        return {"ok": p}
+
+    tool = Tool("scan", "扫描", scan,
+                parameters={"type": "object", "properties": {"path": {"type": "string"}},
+                            "required": ["path"]})
+    llm = _ChatStub([_Msg(tool_calls=[_tc("scan", '{"path": "/a/b"}')]),
+                     _Msg(content="扫完了")])
+    AgentCore(llm, tools={"scan": tool}).run("扫 /a/b")
+    assert captured["p"] == "/a/b"
+
+
+def test_context_flows_into_system():
     seen = {}
 
-    class CapLLM:
+    class Cap:
         available = True
 
-        def complete(self, system, user):
-            if "规划器" in system:
-                seen["plan"] = system
-                return '[{"tool": "echo", "why": "x"}]'
-            if "执行器" in system:
-                seen["act"] = system
-                return "Action: Finish[done]"
-            return '{"score": 9, "complete": true, "missing": [], "next": ""}'
-
-    core = AgentCore(CapLLM())
-    core.run(goal="把这个忽略", context="上次盲区: app.py::get_user [cache]")
-    assert "app.py::get_user" in seen.get("plan", "")
-    assert "app.py::get_user" in seen.get("act", "")
-
-
-def test_act_salvages_conversational_reply():
-    """模型没给 Action、只是自然语言回答（如「你是谁」）→ 用它的话当答案，不报「无法解析动作」。"""
-    class Conv:
-        available = True
+        def chat(self, messages, tools=None):
+            seen["sys"] = messages[0]["content"]
+            return _Msg(content="ok")
 
         def complete(self, system, user):
-            if "规划器" in system:
-                return "[]"                                   # 无需工具
-            if "执行器" in system:
-                return "你是 jiojio，本项目的主要负责人。"      # 直接对话回答，无 Action
-            return '{"score": 9, "complete": true, "missing": [], "next": ""}'
+            return '{"score":9,"complete":true,"missing":[],"next":""}'
 
-    core = AgentCore(Conv())
-    run = core.run("还记得我是谁吗", context="[NOTES] (global) 我是主要负责人jiojio")
-    assert "jiojio" in run.answer
-    assert "无法解析动作" not in run.answer
+    AgentCore(Cap()).run(goal="把这个忽略", context="上次盲区: app.py::get_user [cache]")
+    assert "app.py::get_user" in seen.get("sys", "")
 
 

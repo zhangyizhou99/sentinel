@@ -37,12 +37,34 @@ class LLMClient:
         resp = self._client.chat.completions.create(  # type: ignore[union-attr]
             model=self.config.model,
             temperature=self.config.temperature,
+            max_tokens=1024,               # 输出上限：防失控（呼应成本护栏）
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
         )
         return resp.choices[0].message.content or ""
+
+    def chat(self, messages, tools=None):
+        """多轮 + 原生 function calling。返回底层 message 对象（含 .content 与 .tool_calls）。
+
+        这是「业界成熟做法」的地基：不再手搓文本 ReAct + 正则解析动作，
+        而是让模型原生返回结构化 tool_calls，从根上消除格式/误判脆弱性。
+        """
+        if not self.available:
+            raise RuntimeError(f"LLM 不可用：{self._error}")
+        kwargs = {
+            "model": self.config.model,
+            "temperature": self.config.temperature,
+            "max_tokens": 1024,
+            "messages": messages,
+        }
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+        resp = self._client.chat.completions.create(**kwargs)  # type: ignore[union-attr]
+        return resp.choices[0].message
+
 
     def _init(self) -> None:
         """尝试初始化底层客户端；任何缺失都记为原因，不抛异常。"""

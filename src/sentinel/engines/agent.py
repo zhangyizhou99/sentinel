@@ -25,10 +25,14 @@ _GOOD_ENOUGH = 8
 
 @dataclass
 class Tool:
-    """一个工具：名字 + 说明 + 实现函数（吃一个字符串输入，返回任意结果）。"""
+    """一个工具：名字 + 说明 + 实现函数（吃一个字符串输入，返回任意结果）。
+
+    parameters：function calling 的 JSON schema（OpenAI 格式）；为 None 时用默认单字符串参数。
+    """
     name: str
     description: str
     func: Callable[[str], Any]
+    parameters: Optional[Dict[str, Any]] = None
 
 
 def _default_tools() -> Dict[str, Tool]:
@@ -163,11 +167,12 @@ class AgentCore:
     """
 
     def __init__(self, llm, tools: Optional[Dict[str, Tool]] = None,
-                 max_rounds: int = 2, max_act_steps: int = 6):
+                 max_rounds: int = 2, max_act_steps: int = 6, max_steps: int = 8):
         self.llm = llm
         self.tools = tools if tools is not None else _default_tools()
         self.max_rounds = max_rounds
         self.max_act_steps = max_act_steps
+        self.max_steps = max_steps          # function-calling 循环的步数上限（防跑飞）
 
     def _tools_desc(self) -> str:
         return "\n".join(f"- {t.name}: {t.description}" for t in self.tools.values())
@@ -272,9 +277,15 @@ class AgentCore:
 
     @staticmethod
     def _parse(text: str):
-        """从模型输出里解析 Thought 与 Action(tool[input])。"""
-        thought_m = re.search(r"Thought:\s*(.*?)(?=\nAction:|$)", text or "", re.DOTALL)
-        action_m = re.search(r"Action:\s*(\w+)\[(.*)\]", text or "", re.DOTALL)
+        """从模型输出里解析 Thought 与 Action。
+
+        容错：ReAct 约定是 `Action: tool[input]`（方括号），但模型常被工具描述里的
+        `tool(input)` 函数风格带偏而写成圆括号——两种都接受，避免因括号类型丢动作。
+        """
+        t = text or ""
+        thought_m = re.search(r"Thought:\s*(.*?)(?=\nAction:|$)", t, re.DOTALL)
+        action_m = (re.search(r"Action:\s*(\w+)\s*\[(.*)\]", t, re.DOTALL)
+                    or re.search(r"Action:\s*(\w+)\s*\((.*)\)", t, re.DOTALL))
         thought = thought_m.group(1).strip() if thought_m else None
         action = (action_m.group(1).strip(), action_m.group(2).strip()) if action_m else None
         return thought, action
@@ -309,27 +320,94 @@ class AgentCore:
     # -- 编排 ---------------------------------------------------------------
 
     def run(self, goal: str, context: str = "") -> AgentRun:
-        """一次完整自治运行：先 Plan，再 Act/Reflect 直到足够好。
+        """一次完整自治运行：**function calling 循环**（业界成熟做法）。
 
-        context：会话背景（近期对话 + 上次扫描结果），让“把这个忽略”这类多轮指代能解析。
+        模型看[对话 + 工具清单] → 原生返回结构化 tool_calls 或最终答案；
+        有工具调用就执行→回喂→继续；没有就结束。不再手搜文本 ReAct + 正则解析，
+        从根上消除格式/误判脆弱性（园括号/复述不执行那类 bug）。
+        context：会话背景（近期对话 + 上次扫描），让多轮指代能解析。
         """
         run = AgentRun(goal=goal, context=context or "")
-        run.plan = self.plan(goal, context=run.context)
-        # B2：对话式问题（plan 返回空计划）直接答，不进 reflect/重规划循环——
-        # 对话不该用「必须调工具达成目标」的标准苛求，避免 reflect 无据打低分而空转。
-        if not run.plan:
-            run.rounds = 1
-            self.act(run)
-            return run
-        for round_i in range(1, self.max_rounds + 1):
-            run.rounds = round_i
-            self.act(run)
-            verdict = self.reflect(run)
-            run.reflections.append(verdict)
-            if verdict.get("complete") or int(verdict.get("score", 0)) >= _GOOD_ENOUGH:
-                break
-            hint = verdict.get("next") or "; ".join(verdict.get("missing", []))
-            if not hint:
-                break
-            run.plan = self.plan(goal, hint=hint, context=run.context)  # 带反思提示重规划
+        messages = [
+            {"role": "system", "content": self._system(run.context)},
+            {"role": "user", "content": goal},
+        ]
+        specs = self._tool_specs()
+        for _ in range(self.max_steps):
+            msg = self.llm.chat(messages, tools=specs)
+            tool_calls = getattr(msg, "tool_calls", None) or []
+            if msg.content:
+                run.transcript.append({"type": "thought", "content": msg.content})
+            if not tool_calls:
+                run.answer = (msg.content or "").strip() or "（无回复）"
+                run.transcript.append({"type": "finish", "content": run.answer})
+                self._maybe_reflect(run)
+                return run
+            # 把 assistant 消息（含 tool_calls）回写历史，再逐个执行工具。
+            messages.append({
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": [
+                    {"id": tc.id, "type": "function",
+                     "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                    for tc in tool_calls
+                ],
+            })
+            for tc in tool_calls:
+                name = tc.function.name
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except (ValueError, TypeError):
+                    args = {}
+                arg = args.get("input")
+                if arg is None:                       # 兼容语义化参数名（path/query/branch...）
+                    arg = next((v for v in args.values()), "")
+                observation = self._run_tool(name, str(arg))
+                run.transcript.append({"type": "action", "tool": name,
+                                       "input": str(arg), "observation": observation})
+                if "error" in observation:
+                    run.failures.append({"tool": name, "input": str(arg),
+                                         "error": observation["error"]})
+                messages.append({"role": "tool", "tool_call_id": tc.id,
+                                 "content": json.dumps(observation, ensure_ascii=False)})
+        run.answer = run.answer or "（达到步数上限 | reached step limit）"
+        run.transcript.append({"type": "finish", "content": run.answer})
+        self._maybe_reflect(run)
         return run
+
+    def _system(self, context: str) -> str:
+        """系统提示：身份 + 行为原则 + 会话背景。不需 ReAct 格式说明（function calling 自动处理）。"""
+        return (
+            "你是 Sentinel，一个面向多人协作代码库的可观测性守护 Agent。\n"
+            "你可以调用工具来查找项目、扫描监控盲区、补埋点、记/查笔记等。\n"
+            "原则：\n"
+            "- 用户表达了**执行意图**（扫描/补埋点/查找等）——哪怕夹着疑问或抱怨——就**直接调用对应工具**，不要只复述用户意图。\n"
+            "- 纯对话/能直接从背景回答的，就直接回答，不必硬调工具。\n"
+            "- 调工具时用绝对路径，不臆造不存在的路径；指代（这个/那个/再扫一遍）结合背景消解。\n\n"
+            f"会话背景 CONTEXT：\n{context or '（无）'}"
+        )
+
+    def _tool_specs(self):
+        """把工具集转成 OpenAI function calling 的 tools schema。"""
+        specs = []
+        for t in self.tools.values():
+            params = t.parameters or {
+                "type": "object",
+                "properties": {"input": {"type": "string",
+                                         "description": "工具输入（如路径/关键词/分支名）"}},
+                "required": ["input"],
+            }
+            specs.append({"type": "function",
+                          "function": {"name": t.name, "description": t.description,
+                                       "parameters": params}})
+        return specs
+
+    def _maybe_reflect(self, run: AgentRun) -> None:
+        """只对「有工具调用」的运行做一次反思（纯对话不反思，省调用）；失败不阻断。"""
+        if not any(t.get("type") == "action" for t in run.transcript):
+            return
+        run.rounds = 1
+        try:
+            run.reflections.append(self.reflect(run))
+        except Exception:  # noqa: BLE001
+            pass
