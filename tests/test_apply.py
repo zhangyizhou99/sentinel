@@ -107,3 +107,19 @@ def test_apply_tool_proposes_without_editing():
     assert any("checkin" in u for u in prop["unit_ids"])
     assert prop["suggested_branch"].startswith("sentinel/instrument-")
     assert (d / "svc.py").read_text() == src            # 关键：没改代码
+
+
+def test_apply_rejects_non_python_before_branching():
+    """全是非 Python 盲区 → 提前拒绝，不建空分支（避免'切了分支啥也没补'的困惑）。"""
+    from sentinel.model.code_unit import CodeUnit
+    d = _make_repo()
+    ts = CodeUnit(file="app.ts", qualname="f", kind="function", signature="()",
+                  calls=["fetch"], has_instrumentation=False, language="typescript")
+    try:
+        Applier().apply(str(d), [ts], "b1")
+        assert False, "应因非 Python 而拒绝"
+    except ApplyError as e:
+        assert "Python" in str(e) or "只支持" in str(e)
+    r = subprocess.run(["git", "-C", str(d), "rev-parse", "--verify", "b1"],
+                       capture_output=True, text=True)
+    assert r.returncode != 0                             # 关键：没建分支 b1

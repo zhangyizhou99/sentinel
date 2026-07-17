@@ -65,6 +65,10 @@ class Applier:
             raise ApplyError("需要分支名（请自己输入）| branch name required")
         if not units:
             raise ApplyError("无盲区可补 | no blind spots to fix")
+        if not any(u.file.endswith(".py") for u in units):
+            raise ApplyError(
+                "这些盲区暂不支持自动补埋点（目前只支持 Python；前端 TS/JS 的补埋点待后续）。"
+                " | only Python is supported for now")
 
         self._require_git_repo(repo)
         self._require_clean(repo)
