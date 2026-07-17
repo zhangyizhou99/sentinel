@@ -95,18 +95,17 @@ def test_apply_follows_structlog_convention():
     ast.parse(txt)
 
 
-def test_apply_tool_proposes_without_editing():
-    """apply 工具是提议器：产出提议 + 建议分支名，但绝不直接改代码。"""
+def test_apply_tool_executes_selected_target():
+    """apply 工具是结构化执行器：按 targets 只补选中的盲区（意图理解在上游由 LLM 完成）。"""
     from sentinel.engines.agent_tools import build_apply_tool
-    d = Path(tempfile.mkdtemp())
-    src = "def checkin():\n    return redis.get('k')\n"
-    (d / "svc.py").write_text(src)
-    out = build_apply_tool().func(str(d))
-    prop = out["proposed_apply"]
-    assert prop["count"] == 1
-    assert any("checkin" in u for u in prop["unit_ids"])
-    assert prop["suggested_branch"].startswith("sentinel/instrument-")
-    assert (d / "svc.py").read_text() == src            # 关键：没改代码
+    d = _make_repo()   # svc.py: checkin(redis/cache) + load_cargo(db)
+    out = build_apply_tool().func({"repo": str(d), "targets": "checkin", "branch": "sel"})
+    applied = out["applied"]
+    assert applied["units_fixed"] == ["svc.py::checkin"]     # 只补了 checkin
+    txt = (d / "svc.py").read_text()
+    assert "checkin touches" in txt
+    assert "load_cargo touches" not in txt                   # 没补 load_cargo
+    ast.parse(txt)
 
 
 def test_apply_rejects_non_python_before_branching():

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Dict, Optional
 
 from sentinel.engines.agent import Tool
@@ -218,52 +219,93 @@ def build_scan_tool(broker: Optional[PermissionBroker] = None, memory=None, note
 # ---- apply_instrumentation：提议给盲区补埋点（破坏性，但只提议不改代码）------------
 
 _APPLY_DESC = (
-    "apply_instrumentation(仓库路径或名) —— 【提议给盲区补埋点，破坏性，但**不直接改代码**】"
-    "对扫描出的盲区函数产出补埋点提议：返回「要补哪些函数 + 建议分支名」，"
-    "绝不直接改代码——真正改代码要用户在界面点「同意」后才执行。"
-    "仅当用户明确想补埋点 / 修复监控盲区时才调用；不确定给哪个仓库补就先扫描或问清。 | "
-    "apply_instrumentation(repo): propose instrumenting blind-spot functions. Returns a proposal "
-    "(which functions + suggested branch); NEVER edits code directly — edits happen only after "
-    "the user confirms in the UI."
+    "apply_instrumentation(targets, branch, repo) —— 【给盲区补埋点，会改代码，破坏性】"
+    "对仓库监控盲区函数补埋点，改动落到一个新 git 分支、**未提交**（用户可 review diff 后自己提交或丢弃，原分支不动，安全）。\n"
+    "参数：targets=补哪些（留空=全部；或逗号分隔的函数名/关键词，如 'checkin' 或 'checkin,load_cargo'）——"
+    "用户说「只补第一个 / 前两个 / 除了 X 都补」时，你要先看扫描结果把它对应到具体函数名再填；"
+    "branch=分支名（用户指定就用，没说留空=用建议名）；repo=仓库路径（一般是最近扫的，可留空）。\n"
+    "仅当用户明确要补埋点/修复盲区时调用。目前只支持 Python，前端 TS/JS 暂不支持。 | "
+    "apply_instrumentation: instrument blind-spot functions; edits land on a new uncommitted git branch."
 )
 
 
 def _suggest_branch(repo: str) -> str:
-    """给一个建议分支名：sentinel/instrument-<仓库名>（用户可在界面改）。"""
+    """给一个建议分支名：sentinel/instrument-<仓库名>。"""
     name = os.path.basename(os.path.abspath(repo).rstrip(os.sep)) or "repo"
     return f"sentinel/instrument-{name}"
 
 
-def build_apply_tool(broker: Optional[PermissionBroker] = None, memory=None) -> Tool:
-    """构造 apply_instrumentation 工具（**提议器**：只产出补埋点提议，绝不直接改代码）。
+def _select_targets(spots, targets: str):
+    """按 targets 从盲区里选出要补的（确定性；意图理解由 LLM 在上游完成）。
 
-    破坏性执行由 UI 人审门接管——用户确认分支名后才真跑 Applier（DESIGN §8.3）。
-    因为本工具不改代码，agent 自治调用它是安全的：门在「执行」那一步，不在「提议」这一步。
+    空/all=全部；纯数字=第 N 个；否则按逗号分隔的关键词子串匹配 unit_id。
     """
-    def _propose(target: str) -> Dict[str, Any]:
-        p = _clean(target)
-        if not p and memory is not None:
-            p = memory.last_repo or ""
-        if not p:
-            return {"error": "不知道要给哪个仓库补埋点，请先扫描或指明仓库 | which repo?"}
-        if not os.path.exists(p):
-            return {"error": f"路径不存在 | path not found: {p}"}
-        if broker is not None and not broker.within_scope(p):
-            return {"denied": os.path.abspath(p), "reason": "超出允许的工作区范围 | out of workspace"}
-        result = scan_repo(p)
+    t = (targets or "").strip()
+    if not t or t.lower() in ("all", "全部", "所有", "全部盲区"):
+        return list(spots)
+    if t.isdigit():
+        n = int(t)
+        return list(spots[n - 1:n]) if 1 <= n <= len(spots) else []
+    keys = [k.strip().lower() for k in re.split(r"[,，、\s]+", t) if k.strip()]
+    return [u for u in spots if any(k in u.unit_id.lower() for k in keys)]
+
+
+def build_apply_tool(broker: Optional[PermissionBroker] = None, memory=None,
+                     notes=None, procedural=None) -> Tool:
+    """构造 apply_instrumentation 工具（**结构化执行器**）。
+
+    LLM 从用户的话 + 扫描结果里填 branch/targets（意图理解归 LLM）；工具按 targets 确定性过滤
+    盲区并真执行 Applier（改代码到新分支未提交）。安全网 = git 新分支未提交（用户 review diff 后 commit/丢弃）。
+    """
+    def _apply(args) -> Dict[str, Any]:
+        if not isinstance(args, dict):
+            args = {"targets": str(args)}
+        repo = _clean(args.get("repo", "")) or (memory.last_repo if memory else "") or ""
+        if not repo:
+            return {"error": "不知道要给哪个仓库补埋点，请先扫描或指明仓库"}
+        if not os.path.exists(repo):
+            return {"error": f"路径不存在: {repo}"}
+        if broker is not None and not broker.within_scope(repo):
+            return {"denied": os.path.abspath(repo), "reason": "超出允许的工作区范围"}
+        result = scan_repo(repo)
         spots = result.blind_spots
         if memory is not None:
-            ignored = memory.ignored_units(p)
+            ignored = memory.ignored_units(repo)
             spots = [u for u in spots if u.unit_id not in ignored]
         if not spots:
-            return {"proposed_apply": None, "note": "没有需要补埋点的盲区（或都被标记忽略）"}
-        return {"proposed_apply": {
-            "repo": os.path.abspath(p),
-            "unit_ids": [u.unit_id for u in spots],
-            "count": len(spots),
-            "suggested_branch": _suggest_branch(p),
+            return {"error": "没有需要补埋点的盲区（或都被标记忽略）"}
+        targets = (args.get("targets") or "").strip()
+        selected = _select_targets(spots, targets)
+        if not selected:
+            return {"error": f"没找到匹配「{targets}」的盲区；可选："
+                             + ", ".join(u.unit_id for u in spots[:10])}
+        branch = (args.get("branch") or "").strip() or _suggest_branch(repo)
+        from sentinel.engines.apply import Applier, ApplyError
+        from sentinel.engines.conventions import learn_convention
+        conv = learn_convention(repo, result.units)
+        try:
+            res = Applier().apply(repo, selected, branch, convention=conv, procedural=procedural)
+        except ApplyError as e:
+            return {"error": str(e)}
+        return {"applied": {
+            "branch": res.branch, "base_branch": res.base_branch,
+            "units_fixed": res.units_fixed, "skipped": res.skipped,
+            "files_changed": res.files_changed, "diff": res.diff[:3000],
+            "message": res.message,
         }}
-    return Tool("apply_instrumentation", _APPLY_DESC, _propose)
+
+    params = {
+        "type": "object",
+        "properties": {
+            "targets": {"type": "string", "description":
+                        "补哪些盲区：留空=全部；或逗号分隔的函数名/关键词（如 checkin 或 checkin,load_cargo）。"
+                        "用户说「第一个/前两个/除了X」时，先看扫描结果把它对应到具体函数名再填。"},
+            "branch": {"type": "string", "description":
+                       "补埋点落到的新 git 分支名（用户指定就用，没说留空=用建议名）"},
+            "repo": {"type": "string", "description": "仓库绝对路径（一般是最近扫描的，可留空）"},
+        },
+    }
+    return Tool("apply_instrumentation", _APPLY_DESC, _apply, parameters=params, structured=True)
 
 
 # ---- check_language_support：报告语言覆盖面与缺口（只读，免授权）--------------

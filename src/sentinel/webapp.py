@@ -125,7 +125,7 @@ def _build_agent(broker: PermissionBroker) -> AgentCore:
     ignore = build_feedback_tool(mem)                     # 反馈学习：标为不用埋点→下次抑制
     add_note = build_note_tool(notes, mem)               # 记团队笔记 → 判定上下文一等证据
     recall = build_recall_notes_tool(notes, mem)         # 查团队笔记
-    apply = build_apply_tool(broker, memory=mem)         # 破坏性提议器：只提议补埋点，执行走 UI 人审门
+    apply = build_apply_tool(broker, memory=mem, notes=notes, procedural=_get_procedural())  # 结构化执行器：LLM 填 targets/branch，直接补到新分支未提交
     tools = {t.name: t for t in (find, scan, check, install, ignore, add_note, recall, apply)}
     return AgentCore(_LLM, tools=tools)
 
@@ -616,6 +616,28 @@ def _recent_context(chat, state: dict, max_turns: int = 4) -> str:
     return ctx.text
 
 
+def _collect_apply_result(run):
+    """从 transcript 取 apply_instrumentation 的执行结果（含 diff）。"""
+    for item in run.transcript:
+        if item.get("type") == "action" and item.get("tool") == "apply_instrumentation":
+            res = (item.get("observation") or {}).get("result", {})
+            if isinstance(res, dict) and res.get("applied"):
+                return res["applied"]
+    return None
+
+
+def _format_applied(a: dict) -> str:
+    lines = [f"✅ {a.get('message', '已补埋点')}"]
+    if a.get("units_fixed"):
+        lines.append(f"已补 {len(a['units_fixed'])} 个：{', '.join(a['units_fixed'])}")
+    if a.get("skipped"):
+        lines.append(f"⏭ 跳过 {len(a['skipped'])} 个（非 Python / 改写不安全）")
+    diff = a.get("diff", "")
+    if diff:
+        lines.append(f"\n```diff\n{diff}\n```")
+    return "\n".join(lines)
+
+
 def _collect_apply_proposal(run):
     """从 transcript 取 apply_instrumentation 工具的补埋点提议（若有）。"""
     for item in run.transcript:
@@ -702,13 +724,11 @@ def _agent_turn(state: dict, goal: str, context: str = ""):
     denied = _collect(run, "denied")
     if denied:
         return _format_denied(denied, broker), [], []
-    proposal = _collect_apply_proposal(run)
-    if proposal:
-        state["pending_apply"] = proposal
-        return (f"🔧 建议对 **{proposal['count']} 个盲区**补埋点。\n\n"
-                f"分支名用 `{proposal['suggested_branch']}` 可以吗？回复「可以」就用它；"
-                f"或直接告诉我你想要的分支名（如 `fix/obs`）。"), [], []
-    return _format_run(run), [], []
+    reply = _format_run(run)
+    applied = _collect_apply_result(run)          # 补埋点执行了就附上 diff
+    if applied:
+        reply += "\n\n" + _format_applied(applied)
+    return reply, [], []
 
 
 def _approve(state: dict, selected: Optional[str]):
@@ -748,13 +768,6 @@ def _ui_bot(chat, state):
         return chat, *_controls(state.get("pending"), state.get("candidates")), \
             *_ignore_controls(state)
     msg = chat[-1]["content"]
-
-    # 有待确认的补埋点提议 → 这条消息当作「分支名确认/指定/取消」处理。
-    if state.get("pending_apply"):
-        reply = _handle_apply_reply(state, msg)
-        chat.append({"role": "assistant", "content": reply})
-        return chat, *_controls(state.get("pending"), state.get("candidates")), \
-            *_ignore_controls(state)
 
     # 有待授权时，也支持打字「同意/取消」（与按钮等效）。
     if state.get("pending") and _is_affirmative(msg):

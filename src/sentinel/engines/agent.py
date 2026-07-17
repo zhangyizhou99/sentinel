@@ -33,6 +33,7 @@ class Tool:
     description: str
     func: Callable[[str], Any]
     parameters: Optional[Dict[str, Any]] = None
+    structured: bool = False           # True: 工具接收完整参数 dict（多参数）；否则收单字符串
 
 
 def _default_tools() -> Dict[str, Tool]:
@@ -359,14 +360,21 @@ class AgentCore:
                     args = json.loads(tc.function.arguments or "{}")
                 except (ValueError, TypeError):
                     args = {}
-                arg = args.get("input")
-                if arg is None:                       # 兼容语义化参数名（path/query/branch...）
-                    arg = next((v for v in args.values()), "")
-                observation = self._run_tool(name, str(arg))
+                tool = self.tools.get(name)
+                if tool is not None and getattr(tool, "structured", False):
+                    call_arg = args                    # 结构化工具：传完整参数 dict
+                    disp = json.dumps(args, ensure_ascii=False)
+                else:
+                    call_arg = args.get("input")
+                    if call_arg is None:               # 兼容语义化参数名（path/query/branch...）
+                        call_arg = next((v for v in args.values()), "")
+                    call_arg = str(call_arg)
+                    disp = call_arg
+                observation = self._run_tool(name, call_arg)
                 run.transcript.append({"type": "action", "tool": name,
-                                       "input": str(arg), "observation": observation})
+                                       "input": disp, "observation": observation})
                 if "error" in observation:
-                    run.failures.append({"tool": name, "input": str(arg),
+                    run.failures.append({"tool": name, "input": disp,
                                          "error": observation["error"]})
                 messages.append({"role": "tool", "tool_call_id": tc.id,
                                  "content": json.dumps(observation, ensure_ascii=False)})
