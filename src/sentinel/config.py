@@ -28,6 +28,21 @@ PROVIDERS: Dict[str, Dict[str, str]] = {
         "api_key_env": "MOONSHOT_API_KEY",
         "default_model": "moonshot-v1-8k",
     },
+    # GitHub Models：用 GitHub Token 调用，OpenAI 兼容，个人有免费额度。
+    # key = GitHub PAT（需勾选 models 权限）；模型名带 publisher 前缀。
+    "github": {
+        "base_url": "https://models.github.ai/inference",
+        "api_key_env": "GITHUB_TOKEN",
+        "default_model": "openai/gpt-4o-mini",
+    },
+    # 本地 copilot-api 代理：把 GitHub Copilot 订阅包成 OpenAI 兼容接口。
+    # 订阅制计费（不按 token）；key 代理不校验，填任意值。
+    # 需先启动代理：bun run ./src/main.ts start --port 4141 --rate-limit 5
+    "copilot": {
+        "base_url": "http://localhost:4141/v1",
+        "api_key_env": "COPILOT_API_KEY",
+        "default_model": "gpt-4o",
+    },
 }
 
 

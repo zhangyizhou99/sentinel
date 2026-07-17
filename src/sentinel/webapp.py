@@ -107,7 +107,7 @@ def _build_agent(broker: PermissionBroker) -> AgentCore:
     mem = _get_memory()
     notes = _get_notes()
     find = build_find_repo_tool(broker)
-    scan = build_scan_tool(broker, memory=mem)            # 带记忆：抑制被拒的 + 记录运行
+    scan = build_scan_tool(broker, memory=mem, notes=notes)  # 带记忆：抑制被拒的 + 记录运行 + 学埋点约定
     check = build_check_language_tool(broker)             # 只读：报告语言覆盖缺口
     install = build_install_language_tool(_LLM)           # 破坏性：须用户明确同意后才补齐
     ignore = build_feedback_tool(mem)                     # 反馈学习：标为不用埋点→下次抑制
@@ -383,7 +383,7 @@ def _format_scan_result(path: str) -> str:
 
     仍走带记忆的 scan 工具，这样反馈抑制/运行记录在无 LLM 时同样生效。
     """
-    report = build_scan_tool(broker=None, memory=_get_memory()).func(path)
+    report = build_scan_tool(broker=None, memory=_get_memory(), notes=_get_notes()).func(path)
     if isinstance(report, dict) and "blind_spots" in report:
         return _report_with_judge(report, path)
     return f"扫描 `{path}` 未返回结果。"
@@ -598,7 +598,7 @@ def _recent_context(chat, state: dict, max_turns: int = 4) -> str:
              for m in (chat or []) if m.get("role") in ("user", "assistant")][:-1]
     repo = (last or {}).get("repo", "")
     target = ContextTarget(repo=repo, turns=turns[-max_turns:], last_scan=last)
-    ctx = default_turn_builder(notes=_get_notes()).build(target)
+    ctx = default_turn_builder(notes=_get_notes(), episodic=_get_memory()).build(target)
     return ctx.text
 
 
@@ -615,7 +615,7 @@ def _agent_turn(state: dict, goal: str, context: str = ""):
         note = f"_（无 LLM key，纯扫描模式：{_LLM.why_unavailable()}）_\n\n"
         if path and broker.within_scope(path):
             _authorize_open(path)  # 显式发起扫描 = 隐含同意，其文件可被 /open 打开
-            report = build_scan_tool(broker=None, memory=_get_memory()).func(path)
+            report = build_scan_tool(broker=None, memory=_get_memory(), notes=_get_notes()).func(path)
             _stash_scan(state, report)
             return note + (_render_report(report) if isinstance(report, dict)
                            and "blind_spots" in report else str(report)), [], []
@@ -649,7 +649,7 @@ def _approve(state: dict, selected: Optional[str]):
     except PermissionError as e:
         return f"⛔ {e}"
     _authorize_open(target)  # 授权成功 → 其下文件今后可被 /open 打开
-    report = build_scan_tool(broker, memory=_get_memory()).func(target)
+    report = build_scan_tool(broker, memory=_get_memory(), notes=_get_notes()).func(target)
     if isinstance(report, dict) and "blind_spots" in report:
         _stash_scan(state, report)                        # 存盲区快照，供下一轮指代 + 忽略按钮
         return _report_with_judge(report, target)

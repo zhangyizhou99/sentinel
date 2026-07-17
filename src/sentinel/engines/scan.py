@@ -14,20 +14,14 @@ from typing import Dict, List
 
 from sentinel.model.code_unit import CodeUnit
 from sentinel.scanners import get_scanner_for
+from sentinel.scanners.signals import SIGNAL_WORDS, signals_in_calls
 
 # 跳过的目录（生成物 / 依赖 / 虚拟环境等）。
 _SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__",
               "dist", "build", ".mypy_cache", ".pytest_cache", "site-packages"}
 
-# 「调用点号名里含这些子串」→ 对应可观测性信号（该函数是监控候选）。
-OBS_SIGNALS: Dict[str, str] = {
-    "redis": "cache", "memcache": "cache",
-    "execute": "db", "query": "db", "cursor": "db", "session": "db",
-    "sqlalchemy": "db", "psycopg": "db", "pymysql": "db", "sqlite": "db",
-    "requests": "http", "httpx": "http", "urllib": "http", "aiohttp": "http", "urlopen": "http",
-    "boto3": "cloud", "kafka": "queue", "pika": "queue", "celery": "queue",
-    "socket": "network",
-}
+# 向后兼容：OBS_SIGNALS 现为「Python 信号包」的别名（完整多语言词典见 scanners/signals.py）。
+OBS_SIGNALS: Dict[str, str] = SIGNAL_WORDS["python"]
 
 
 @dataclass
@@ -50,14 +44,18 @@ class ScanResult:
 
 
 def signals_of(unit: CodeUnit) -> List[str]:
-    """这个函数命中的可观测性信号（去重）。"""
-    found = set()
-    for call in unit.calls:
-        low = call.lower()
-        for key, sig in OBS_SIGNALS.items():
-            if key in low:
-                found.add(sig)
-    return sorted(found)
+    """这个函数命中的可观测性信号（去重）。按语言选对应信号包（L1）。"""
+    lang = getattr(unit, "language", "") or _lang_of_file(unit.file)
+    return signals_in_calls(unit.calls, lang)
+
+
+def _lang_of_file(file: str) -> str:
+    """从文件名后缀推语言（unit.language 为空时的兑底）。"""
+    try:
+        from sentinel.scanners.catalog import language_for_ext
+        return language_for_ext(os.path.splitext(file or "")[1])
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def scan_file(path: str, rel_path: str) -> List[CodeUnit]:

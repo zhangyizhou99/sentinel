@@ -11,7 +11,7 @@ from typing import Dict, List, Optional
 
 from sentinel.model.code_unit import CodeUnit
 from sentinel.scanners.base import LanguageScanner, register
-from sentinel.scanners.instrumentation import INSTRUMENTATION_HINTS  # 埋点判据现为跨语言共享
+from sentinel.scanners.instrumentation import has_instrumentation  # 埋点判据（多语言）
 
 # 用于别名解析：右侧点号名含这些子串就认为是可观测性依赖（与 OBS_SIGNALS 的 key 一致即可）。
 _DEP_KEYS = (
@@ -76,7 +76,7 @@ def _extract_from_function(fn: ast.AST, prefix: str, aliases: Dict[str, str]) ->
             body_parts.append(_dotted_name(node).lower())
 
     body_blob = " ".join(body_parts)
-    has_instr = any(h in body_blob for h in INSTRUMENTATION_HINTS)
+    has_instr = has_instrumentation(body_blob, "python")
     decorators = [_dotted_name(d) if not isinstance(d, ast.Call) else _dotted_name(d.func)
                   for d in getattr(fn, "decorator_list", [])]
     return CodeUnit(
@@ -116,6 +116,7 @@ class PythonScanner(LanguageScanner):
         units = _walk_body(tree.body, prefix="", aliases=aliases)
         for u in units:
             u.file = rel_path
+            u.language = "python"
         return units
 
 

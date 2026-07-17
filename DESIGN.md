@@ -107,6 +107,37 @@ flowchart TB
 
 ---
 
+### 2.2 信号识别：三层召回漏斗（L1 已落地 / L2·L3 规划）
+
+**问题**：判断「这个函数碰了外部依赖吗」（信号识别）此前是**纯确定性子串匹配**（一张 `OBS_SIGNALS` 库名表），
+LLM 只在下游 `judge_intent`（信号已定后判该埋什么）出现。于是**封装/语义化的调用够不着**——
+`api.get()` / `fetchWaybills()` / 自定义 hook / `self.client.request()` 的 `calls` 里不含 `requests`/`fetch`，
+子串撞不到 → `signals_of` 返回空 → 不是盲区 → judge 根本没机会跑。这是 **false negative（盲区被静默跳过）**，
+比误报更危险。前端尤甚（fetch/axios/XHR/GraphQL/React-Query/自封装 client，方式无穷且几乎总被封装）。
+
+**策略**：把信号识别改成**语言无关的三层召回漏斗**，让 LLM 只花在确定性够不着的边缘（既提召回，又控成本）：
+
+| 层 | 做什么 | 成本 | 解决 |
+|---|---|---|---|
+| **L1 确定性直接匹配** ✅ | 按语言分包的信号词典（`scanners/signals.py`：Python 包 + JS/TS 包）+ 多语言埋点判据（`instrumentation.py` 按语言分派）。子串匹配 `calls`。 | 免费/秒级/air-gapped | 直接调用 |
+| **L2 调用图传播** ⏳ | 本仓库内：`checkin()`→`fetchWaybills()`→`axios.get`，信号沿调用链回传给调用者。 | 免费 | **本仓库自封装** |
+| **L3 LLM 语义兜底** ⏳ | 对 L1/L2 未命中但**结构可疑**的函数（调无法解析的外部符号 / async / 命名可疑），批量交 LLM 判「是否触及外部依赖、哪类」。 | 受控 | **第三方/语义化封装** |
+
+**L3 成本护栏**（硬约束，呼应 §13 与真实烧钱教训）：可疑筛选闸门（只喂少数）+ **批量**（一次 prompt 判多个函数）+
+内容哈希缓存（`AugmentationCache` 思路，没变不重判）+ 每次扫描硬上限 N + 无 LLM 自动退回 L1+L2（air-gapped 行为不变）。
+L3 的 Prompt 须与用户共审（§13 规范）。
+
+**L1 已落地细节**：`CodeUnit` 加 `language` 字段（两个 scanner 注入）；`scanners/signals.py` 多语言信号词典
+（`SIGNAL_WORDS[language]`，未知语言用全并集宽松召回）；`instrumentation.py` 埋点判据按语言分派（**不认 `console.log`**
+——它是调试非遥测，且前端满地都是，当埋点会掩盖真盲区；只认 `console.error/warn` 与结构化遥测 SDK）。
+子串法有意「宁可多召回」（如 JS 的 `request` 会连带命中封装名，也会有噪声），假阳由 L3 精修。
+
+**教学点**：结构性的事（解析/直接调用）用确定性代码免费兜底多数；**语义性的事在确定性够不着时才升级 LLM**。
+分层同时管住 **Precision/Recall 权衡**（L3 提召回，用 judge 的 confidence + 人审门兜假阳）与 **成本/覆盖权衡**（钱只花在边缘）。
+这是 §2 两级漏斗（结构用确定性、语义才用 LLM）的自然延伸，非推翻。
+
+---
+
 ## 3. 第一次读代码：数据清洗与存储
 
 **流程**：`原始仓库 → 解析 → 清洗 → 切块 → 结构化元数据 → (向量化) → 落库`
@@ -283,22 +314,64 @@ flowchart LR
 
 ## 8. 自主学习与记忆（能否自学 + 怎么记）
 
-**能自学。** 分层记忆 + 反馈闭环（第8章记忆 + 第11章 Agentic-RL）：
+**能自学。** 三层记忆 + 反馈闭环（第8章记忆 + 第11章 Agentic-RL）。三层各司其职：
+
+| 记忆 | 认知类比 | 存什么 | 载体 | 状态 |
+|---|---|---|---|---|
+| **情节 Episodic** | 我经历过什么 | 每次运行/反馈/部署 | `memory/episodic.py`（SQLite runs/feedback） | ✅ |
+| **语义 Semantic** | 我知道什么（事实/约定） | 通用 RED/USE + **本项目埋点约定** | `engines/knowledge.py`（静态）+ `memory/notes.py`（NoteStore，可学习/可改） | 🟡 补约定学习 |
+| **程序性 Procedural** | 我会做什么（技能/流程） | 补埋点的可复用「修复技能」 | `memory/procedural.py`（SQLite skills） | ⏳ 新增 |
+| 向量 Vector | 相似历史怎么做 | 代码单元向量 | `cognition/` | ✅ |
 
 ```mermaid
 flowchart LR
-    RUN[一次运行] --> EP[(Episodic 情节记忆<br/>SQLite: runs/feedback/deployments)]
-    KB[(Semantic 语义知识库<br/>RED/USE 规则)] --> JUDGE[判定]
-    VEC[(Vector 向量索引<br/>历史代码/决策)] --> JUDGE
+    RUN[一次运行] --> EP[(Episodic 情节<br/>runs/feedback/deployments)]
+    KB[(Semantic 语义<br/>RED/USE + 项目埋点约定)] --> JUDGE[判定]
+    VEC[(Vector 向量<br/>历史代码/决策)] --> JUDGE
+    PROC[(Procedural 程序性<br/>修复技能模板)] --> APPLY[补埋点 apply]
     JUDGE --> RUN
+    APPLY --> RUN
     USER[人反馈 approve/reject] --> EP
+    USER --> PROC
     EP -.下次抑制被拒/复用被批.-> JUDGE
+    PROC -.同类盲区复用补法.-> APPLY
 ```
 
-- **Episodic**：每次运行、每个反馈、每次部署都入 SQLite，形成历史。
-- **Semantic**：RED/USE 等可观测性知识库，判定时召回。
+- **Episodic**：每次运行、每个反馈、每次部署都入 SQLite，形成历史（指代消解、抑制被拒都靠它）。
+- **Semantic**：RED/USE 通用知识（`knowledge.py` 静态）**＋ 可学习的本项目埋点约定**（见 §8.1）。
+- **Procedural**：成功的补埋点手法 → 技能模板 → 复用（见 §8.2）。
 - **Vector**：历史代码与决策向量化，支撑「相似历史怎么做」。
 - **学习闭环**：用户 `reject` 某指标 → 持久化抑制 → **下次不再提**（第11章 Agentic-RL：用反馈当奖励信号）。验收：同仓库第二次运行，被拒项不再出现。
+
+### 8.1 语义记忆·埋点约定学习（入乡随俗）
+
+**问题**：补埋点若用 Sentinel 外来风格（硬编码 `logger.info`），与项目现有约定不符、无法直接合并。
+**做法**：**学项目已有埋点的写法**——
+- **素材**：scan 已标 `has_instrumentation=True` 的函数（`PeerProvider` 也在召回这些已埋点相似函数），它们就是风格样本。
+- **学习**：从这些函数提取埋点模式（import 哪个模块 / 调用什么 / 结构），归纳「本项目埋点约定」（如：structlog，`log = structlog.get_logger()`，事件 `log.info("event", **fields)`）。确定性统计为主（频次最高的写法即约定），LLM 仅在需要归纳自然语言口径时可选介入（Prompt 须共审）。
+- **存储**：写进 NoteStore（repo 级「约定」笔记，标注 `author=sentinel-auto`，人可改可删），`NoteProvider` 自动注入 judge/对话上下文。
+- **使用**：judge 建议 *what* ＋ apply 照约定的 *how* 补 → 风格一致，可直接合并。
+- **兜底**：学不到约定（全新项目/无已埋点样本）→ 退回安全默认（`logger.info`）＋ 提示「未发现项目埋点约定」。
+
+### 8.2 程序性记忆·修复技能（怎么补，可复用）
+
+只做一件实事：**成功的补法 → 存成「修复技能」→ 复用**（别搞花架子）。
+- `key = (语言, 框架, 信号类型)`，如 `(python, fastapi, http)`。
+- `value = 操作模板`：import 什么 / 在哪插 / 插什么模板（一次成功 apply 后提炼）。
+- **复用**：下次同 key 盲区，直接套模板生成，跳过重新推理。
+- **学习信号**：用户接受 → 入库/加权；拒绝 → 不入库/降权（接 Agentic-RL）。
+- **载体**：`memory/procedural.py`（SQLite skills 表）。最小骨架先行，避免过度设计。
+
+### 8.3 Restore·函数级补埋点（apply，roadmap 第7步）
+
+**定位**：§0 术语里的 **Restore**——把盲区自动补齐到基线。与 legacy 的关键区别是**函数级**（对准盲区函数 + 按 judge 建议 + 照项目约定），而非 legacy 的 **app 级中间件**（粒度对不上新版的函数级盲区）。
+
+- **粒度**：函数级。对准 scan 出的盲区函数（`unit_id`）。
+- **改写方式**：**AST 定位 + 行级插入**（按函数体首行 `lineno` + 缩进插入文本），**不用 `ast.unparse`**（会重排格式、丢注释）；沿用 legacy `editor.py` 的「行级插入 + 从下往上插保行号」手法。
+- **埋点内容**：judge 建议 *what*（该埋什么）× 语义约定 *how*（项目什么风格）；学不到约定退默认 log。
+- **安全（复用 legacy 精华）**：git **新分支** + 用户命名 + **未提交**（留工作区给人审）+ **AST 安全网**（改后必须能 parse）+ **幂等**（已埋点跳过）+ 只改有把握的否则跳过 + **破坏性人审门**。
+- **三记忆协同**：语义（*什么风格*）× 程序（*怎么补*）× 情节（*补了啥 + 反馈*）→ 越用越会补。
+- **多语言**：先 Python（`ast`）；TS 补埋点（tree-sitter 改写）后续。
 
 ---
 

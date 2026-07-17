@@ -218,11 +218,14 @@ class AgentCore:
 
             if action is None:
                 # 没有可执行动作：多半是模型在**直接对话回答**（如「你是谁」——答案就在 CONTEXT
-                # 的笔记/对话里，无需工具）。把它说的话当答案，而不是报「无法解析动作」。
-                reply = (thought or _strip_speaker(text)).strip()
-                run.answer = run.answer or reply or "（无法解析动作 | no action parsed）"
-                if reply:
-                    run.transcript.append({"type": "finish", "content": reply})
+                # 的笔记/对话里，无需工具），或在澄清（要扫哪个仓库）。把它说的话当答案回显，
+                # 绝不崩成「无法解析动作」这种废话。
+                reply = (thought or _strip_speaker(text) or (text or "").strip()).strip()
+                if not reply:
+                    reply = ("我不确定要操作哪个仓库，能说得更具体些吗？"
+                             "例如「扫描 haulhero」或「重新扫 haulhero」。")
+                run.answer = run.answer or reply
+                run.transcript.append({"type": "finish", "content": reply})
                 return
 
             name, arg = action
@@ -312,6 +315,12 @@ class AgentCore:
         """
         run = AgentRun(goal=goal, context=context or "")
         run.plan = self.plan(goal, context=run.context)
+        # B2：对话式问题（plan 返回空计划）直接答，不进 reflect/重规划循环——
+        # 对话不该用「必须调工具达成目标」的标准苛求，避免 reflect 无据打低分而空转。
+        if not run.plan:
+            run.rounds = 1
+            self.act(run)
+            return run
         for round_i in range(1, self.max_rounds + 1):
             run.rounds = round_i
             self.act(run)

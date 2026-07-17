@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -26,9 +27,11 @@ SRC_HISTORY = "history"
 SRC_NOTE = "note"
 SRC_PEER = "peer"
 SRC_KNOWLEDGE = "knowledge"
+SRC_FOCUS = "focus"              # 对话级：当前焦点仓库（指代消解，如「再扫一遍」）
 SRC_SCAN = "scan"                # 对话级：上次扫描的盲区快照
+SRC_RUNS = "runs"                # 对话级：跨会话的历史扫描记录（情节记忆）
 SRC_CONVERSATION = "conversation"  # 对话级：近期对话
-_RENDER_ORDER = [SRC_TARGET, SRC_SCAN, SRC_HISTORY, SRC_NOTE, SRC_PEER,
+_RENDER_ORDER = [SRC_TARGET, SRC_FOCUS, SRC_SCAN, SRC_RUNS, SRC_HISTORY, SRC_NOTE, SRC_PEER,
                  SRC_KNOWLEDGE, SRC_CONVERSATION]
 
 _SRC_HEADER = {
@@ -37,7 +40,9 @@ _SRC_HEADER = {
     SRC_NOTE: "[NOTES] 相关团队笔记 | relevant team notes",
     SRC_PEER: "[PEERS] 同仓库已埋点的相似函数 | similar already-instrumented peers",
     SRC_KNOWLEDGE: "[KNOWLEDGE] RED/USE 经验 | RED/USE knowledge",
+    SRC_FOCUS: "[FOCUS] 当前对话焦点 | current conversation focus",
     SRC_SCAN: "[LAST SCAN] 上次扫描的盲区 | blind spots from last scan",
+    SRC_RUNS: "[PAST SCANS] 历史扫描记录（跨会话）| past scans across sessions",
     SRC_CONVERSATION: "[CONVERSATION] 近期对话 | recent conversation",
 }
 
@@ -65,6 +70,7 @@ class ContextTarget:
     goal: str = ""                                   # 本轮用户目标（对话级）
     turns: List = field(default_factory=list)        # 近期对话 [(role, content), ...]
     last_scan: Optional[dict] = None                 # 上次扫描快照 {repo, spots:[{unit_id,signals}]}
+    focus_repo: str = ""                             # 当前焦点仓库（「再扫一遍」等指代的确定目标；空则由 provider 消解）
 
     @property
     def unit_id(self) -> str:
@@ -387,6 +393,61 @@ def default_judge_builder(index=None, notes=None, episodic=None,
 # 对话级证据源（每轮 plan/act 用同一套 ContextBuilder）
 # =====================================================================
 
+class FocusProvider(EvidenceProvider):
+    """对话焦点消解：把「再扫一遍 / 把这个修掉 / 这个文件补一下」这类指代接到具体对象。
+
+    分两层：①确定性锚点——从近期对话/目标里按已知仓库 basename 就近匹配出焦点仓库（省 token、稳）；
+    ②语义引导——在片段里引导 LLM 结合 [LAST SCAN] 盲区与 [CONVERSATION] 近期对话，
+    消解「这个/那个/这种/这个文件」等指代到具体对象（仓库/文件/盲区函数/信号），
+    定位不了就让 act 走 Finish 反问（配合 act 兑底，不臆造、不崩）。
+    """
+
+    def __init__(self, episodic=None):
+        self.episodic = episodic
+
+    def _known_repos(self) -> List[str]:
+        if self.episodic is None:
+            return []
+        try:
+            return list(dict.fromkeys(r.repo for r in self.episodic.list_runs(limit=50)))
+        except Exception:  # noqa: BLE001 —— 一个证据源挂了不拖垮整体
+            return []
+
+    def _resolve(self, target: ContextTarget) -> str:
+        if (target.focus_repo or "").strip():
+            return target.focus_repo.strip()
+        # 从近期对话（近→远）+ 目标里，按已知仓库 basename 就近匹配。
+        repos = self._known_repos()
+        texts = [c for _, c in reversed(list(target.turns or []))] + [target.goal or ""]
+        for t in texts:
+            low = (t or "").lower()
+            for repo in repos:
+                name = os.path.basename(repo.rstrip("/")).lower()
+                if name and name in low:
+                    return repo
+        # 回退：本会话上次扫描。
+        return ((target.last_scan or {}).get("repo") or target.repo or "").strip()
+
+    def provide(self, target: ContextTarget) -> List[ContextSection]:
+        focus = self._resolve(target)
+        if focus:
+            content = (
+                f"当前对话焦点仓库 | focus repo: {focus}\n"
+                "指代消解：用户说「这个 / 那个 / 这种 / 把它修掉 / 上面那个 / 这个文件」等指代时，"
+                "结合 [LAST SCAN] 的盲区列表与 [CONVERSATION] 近期对话，定位具体对象"
+                "（仓库 / 某个文件 / 某个盲区函数 / 某类信号）；能定位就据此操作，"
+                "调工具用绝对路径；定位不了或没有对应工具，就用 Action: Finish[...] 反问说明，切勿臆造。")
+            compact = f"焦点 | focus: {focus}"
+            return [ContextSection(SRC_FOCUS, "focus", content, priority=96,
+                                   ref="", compact=compact, min_chars=20)]
+        content = (
+            "未能确定对话焦点对象。遇到「这个 / 那个 / 这种 / 把它补一下」等指代，"
+            "请结合 [LAST SCAN] 盲区列表与 [CONVERSATION] 近期对话消解；"
+            "实在定位不了或缺少可用工具，用 Action: Finish[...] 说明并反问，切勿臆造路径或对象。")
+        return [ContextSection(SRC_FOCUS, "focus", content, priority=96,
+                               ref="", compact=content[:40], min_chars=20)]
+
+
 class LastScanProvider(EvidenceProvider):
     """上次扫描的盲区快照：让「把这个忽略」这类指代有据可依（含 unit_id）。"""
 
@@ -403,6 +464,49 @@ class LastScanProvider(EvidenceProvider):
         compact = "上次盲区 | last blind spots: " + ", ".join(
             s["unit_id"] for s in ls["spots"][:10])
         return [ContextSection(SRC_SCAN, "last scan", full, priority=88,
+                               ref="", compact=compact, min_chars=20)]
+
+
+class EpisodicRunsProvider(EvidenceProvider):
+    """历史扫描记录（跨会话）：让「我们扫过什么仓库、进度如何」这类回忆有据可依。
+
+    读情节记忆（episodic.db 的 runs 表），按仓库聚合：扫了几次 / 最近一次时间 / 最近盲区数。
+    补上“记忆的另一半”：LastScanProvider 只看本会话内存，重启即失忆；这里从持久化库读。
+    """
+
+    def __init__(self, episodic, max_repos: int = 6):
+        self.episodic = episodic
+        self.max_repos = max_repos
+
+    def provide(self, target: ContextTarget) -> List[ContextSection]:
+        if self.episodic is None:
+            return []
+        try:
+            runs = self.episodic.list_runs(limit=50)
+        except Exception:  # noqa: BLE001 —— 一个证据源挂了不拖垮整体
+            return []
+        if not runs:
+            return []
+        # runs 已按 id DESC（新→旧）；按仓库聚合，首次遇到即最新一次。
+        agg: Dict[str, dict] = {}
+        for r in runs:
+            a = agg.get(r.repo)
+            if a is None:
+                agg[r.repo] = {"count": 1, "last_ts": r.ts,
+                               "last_blind": r.blind_spot_count}
+            else:
+                a["count"] += 1
+        items = list(agg.items())[:self.max_repos]
+        lines = ["历史扫描记录（跨会话，来自情节记忆）| past scans:"]
+        for repo, a in items:
+            name = os.path.basename(repo.rstrip("/")) or repo
+            lines.append(
+                f"  - {name}：共 {a['count']} 次，最近 {a['last_ts'][:10]}，"
+                f"最近一次 {a['last_blind']} 个盲区（{repo}）")
+        full = "\n".join(lines)
+        compact = "历史扫描 | past scans: " + ", ".join(
+            (os.path.basename(repo.rstrip("/")) or repo) for repo, _ in items)
+        return [ContextSection(SRC_RUNS, "past scans", full, priority=76,
                                ref="", compact=compact, min_chars=20)]
 
 
@@ -429,14 +533,17 @@ class ConversationProvider(EvidenceProvider):
         return out
 
 
-def default_turn_builder(notes=None, token_budget: int = 800) -> ContextBuilder:
-    """每轮 plan/act 用的默认构建器：LastScan + Note（仓库约定）+ Conversation。
+def default_turn_builder(notes=None, episodic=None, token_budget: int = 800) -> ContextBuilder:
+    """每轮 plan/act 用的默认构建器：Focus + LastScan + PastScans + Note（仓库约定）+ Conversation。
 
     与 judge 用同一套 ContextBuilder（预算/去重/压缩/溯源一致），只是换了 provider 组合。
+    FocusRepoProvider 把「再扫一遍」等指代确定到具体仓库；episodic 接入跨会话历史扫描记忆。
     """
     return ContextBuilder(
         providers=[
+            FocusProvider(episodic),
             LastScanProvider(),
+            EpisodicRunsProvider(episodic),
             NoteProvider(notes),
             ConversationProvider(),
         ],

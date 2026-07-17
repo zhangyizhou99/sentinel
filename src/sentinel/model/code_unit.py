@@ -23,6 +23,7 @@ class CodeUnit:
     start_line: int = 0
     end_line: int = 0
     has_instrumentation: bool = False           # 是否已埋点（打了 log / metrics / trace）
+    language: str = ""                          # 源语言（python/javascript/typescript/tsx...），供多语言信号/埋点判据
 
     @property
     def unit_id(self) -> str:
@@ -42,5 +43,6 @@ class CodeUnit:
             "decorators": self.decorators, "calls": self.calls,
             "start_line": self.start_line, "end_line": self.end_line,
             "has_instrumentation": self.has_instrumentation,
+            "language": self.language,
             "content_hash": self.content_hash,
         }

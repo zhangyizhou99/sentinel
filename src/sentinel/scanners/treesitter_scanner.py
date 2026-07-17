@@ -90,7 +90,8 @@ class TreeSitterScanner(LanguageScanner):
                 calls=sorted(set(calls)),
                 start_line=fn_node.start_point[0] + 1,
                 end_line=fn_node.end_point[0] + 1,
-                has_instrumentation=has_instrumentation(blob),
+                has_instrumentation=has_instrumentation(blob, self.language),
+                language=self.language,
             ))
         return units
 

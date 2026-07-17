@@ -140,13 +140,14 @@ def build_find_repo_tool(broker: PermissionBroker) -> Tool:
 
 # ---- scan：读取代码内容（需授权）--------------------------------------------
 
-def build_scan_tool(broker: Optional[PermissionBroker] = None, memory=None) -> Tool:
+def build_scan_tool(broker: Optional[PermissionBroker] = None, memory=None, notes=None) -> Tool:
     """构造 scan 工具。
 
     broker=None 时不做权限门（供 CLI 等「用户显式发起 = 已隐含同意」的场景）。
     传入 broker 时（如 Web 会话）：越界拒绝、未授权返回 permission_required。
     传入 memory（EpisodicMemory）时：①抑制用户此前标为 ignore 的函数（反馈学习）；
     ②把本次运行记入情节记忆流水。
+    传入 notes（NoteStore）时：③顺带学习项目埋点约定（入乡随俗）存进语义记忆（DESIGN §8.1）。
     """
     def _scan(path: str) -> Dict[str, Any]:
         p = _clean(path)
@@ -202,6 +203,13 @@ def build_scan_tool(broker: Optional[PermissionBroker] = None, memory=None) -> T
             pass
         if memory is not None:
             memory.record_run(p, blind_spot_count=len(spots), suppressed_count=suppressed)
+        # 入乡随俗：顺带学项目埋点约定（语义记忆）——失败不影响扫描主结果。
+        if notes is not None:
+            try:
+                from sentinel.engines.conventions import learn_and_store
+                learn_and_store(p, result.units, notes)
+            except Exception:  # noqa: BLE001
+                pass
         return report
 
     return Tool("scan", _SCAN_DESC, _scan)

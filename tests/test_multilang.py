@@ -60,15 +60,29 @@ def test_treesitter_scans_typescript_blind_spots():
     _write(d, "svc.ts",
            "export function getUser(id: string) { return redis.get(id); }\n"
            "export function saveOrder(o: any) { logger.info('x'); return db.execute(o); }\n"
-           "const ping = () => httpx.get('/h');\n")
+           "const ping = () => fetch('/h');\n")
     res = scan_repo(d)
     names = {u.qualname for u in res.units}
     assert {"getUser", "saveOrder", "ping"} <= names           # 含箭头函数
     blind = {u.qualname for u in res.blind_spots}
-    assert "getUser" in blind and "ping" in blind              # 无埋点 → 盲区
+    assert "getUser" in blind and "ping" in blind              # 无埋点 → 盲区（fetch 被 JS 信号包识别）
     assert "saveOrder" not in blind                            # 有 logger → 排除
     getuser = next(u for u in res.units if u.qualname == "getUser")
     assert signals_of(getuser) == ["cache"]
+
+
+def test_signal_words_are_language_scoped():
+    """L1 信号按语言分包：前端 fetch/axios 被识别，Python 专属库名不跨语言误配。"""
+    from sentinel.scanners.signals import signals_in_calls
+    # 前端真实网络库被识别
+    assert signals_in_calls(["axios.get"], "typescript") == ["http"]
+    assert signals_in_calls(["fetch"], "tsx") == ["http"]
+    # Python 专属库名（httpx）不在 JS 包里，不跨语言误配
+    assert signals_in_calls(["httpx.get"], "typescript") == []
+    # 但在 Python 包里能识别
+    assert signals_in_calls(["httpx.get"], "python") == ["http"]
+    # 未知语言用并集兑底（宽松召回）
+    assert "http" in signals_in_calls(["fetch"], "")
 
 
 def test_install_language_support_ok():
