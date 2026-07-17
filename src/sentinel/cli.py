@@ -77,6 +77,49 @@ def cmd_feedback(args: argparse.Namespace) -> None:
     memory.close()
 
 
+def cmd_apply(args: argparse.Namespace) -> None:
+    """对盲区函数补埋点：改代码 → 用户命名的新 git 分支，未提交（待人审）。
+
+    走完整三记忆：情节（抑制被忽略）+ 语义（学项目埋点约定）+ 程序性（复用/记录修复技能）。
+    “用户敲命令 + 必填 --branch” 即明确同意，是破坏性操作的人审门。
+    """
+    from sentinel.engines.apply import Applier, ApplyError
+    from sentinel.engines.conventions import learn_and_store
+    from sentinel.memory import NoteStore, ProceduralMemory
+
+    memory = EpisodicMemory()
+    result = scan_repo(args.repo)
+    ignored = memory.ignored_units(args.repo)
+    spots = [u for u in result.blind_spots if u.unit_id not in ignored]
+    if not spots:
+        print("没有需要补埋点的盲区（或都被标记忽略）。")
+        memory.close()
+        return
+
+    notes = NoteStore()
+    conv = learn_and_store(args.repo, result.units, notes)     # 入乡随俗：学并存约定
+    procedural = ProceduralMemory()
+
+    print(f"将对 {len(spots)} 个盲区补埋点，分支：{args.branch}")
+    if conv.found:
+        print(f"（项目埋点约定：{conv.style}）")
+    try:
+        res = Applier().apply(args.repo, spots, args.branch, convention=conv, procedural=procedural)
+    except ApplyError as e:
+        print(f"❌ 无法补埋点：{e}")
+        memory.close()
+        return
+
+    print(res.message)
+    if res.units_fixed:
+        print(f"  ✅ 已补 {len(res.units_fixed)} 个：{', '.join(res.units_fixed)}")
+    if res.skipped:
+        print(f"  ⏭ 跳过 {len(res.skipped)} 个（非 Python / 改写不安全）：{', '.join(res.skipped)}")
+    print(f"\n--- diff 预览（未提交，在分支 {res.branch}）---")
+    print(res.diff[:2000] or "(无 diff)")
+    memory.close()
+
+
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -102,6 +145,11 @@ def build_parser() -> argparse.ArgumentParser:
     fb.add_argument("--instrument", action="store_true", help="标为需要埋点（撤销忽略）")
     fb.add_argument("--list", action="store_true", help="列出该仓库已有反馈")
     fb.set_defaults(func=cmd_feedback)
+
+    ap = sub.add_parser("apply", help="对盲区函数补埋点（改代码 → 新 git 分支，未提交待人审）")
+    ap.add_argument("repo", help="仓库路径")
+    ap.add_argument("--branch", required=True, help="补埋点落在哪个新分支（须自己命名）")
+    ap.set_defaults(func=cmd_apply)
 
     return parser
 

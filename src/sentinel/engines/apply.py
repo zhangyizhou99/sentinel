@@ -32,23 +32,34 @@ class ApplyError(RuntimeError):
     """前置条件失败时抛出。"""
 
 
-def _build_snippet(unit, convention=None):
+_DEFAULT_TEMPLATE = 'logging.getLogger(__name__).info("sentinel: {qualname} touches {signal}")'
+_DEFAULT_IMPORT = "import logging"
+
+
+def _build_snippet(unit, convention=None, procedural=None):
     """为一个盲区函数生成埋点行 + import。
 
-    起步用**自包含的安全默认**（`logging.getLogger(__name__)`，不依赖模块级 logger 变量，
-    保证插入后一定能跑）。约定风格（structlog/otel）待程序性记忆完善后再精确匹配（DESIGN §8.2/8.3）。
+    优先查程序性记忆里同 (语言, 信号) 的修复技能模板（复用学到的补法）；
+    没有则用**自包含安全默认**（`logging.getLogger(__name__)`，不依赖模块级 logger 变量，
+    保证插入后一定能跑）。约定风格（structlog/otel）待模板从项目/反馈学到后再精确（DESIGN §8.2/8.3）。
     """
     from sentinel.engines.scan import signals_of
-    sig = "/".join(signals_of(unit)) or "?"
-    snippet = (f'logging.getLogger(__name__).info('
-               f'"sentinel: {unit.qualname} touches {sig}")')
-    return snippet, "import logging"
+    sigs = signals_of(unit)
+    sig = "/".join(sigs) or "?"
+    primary = sigs[0] if sigs else "?"
+    lang = getattr(unit, "language", "") or "python"
+    template, import_stmt = _DEFAULT_TEMPLATE, _DEFAULT_IMPORT
+    if procedural is not None:
+        skill = procedural.get_skill(lang, primary)
+        if skill:
+            template, import_stmt = skill.snippet_template, skill.import_stmt
+    return template.format(qualname=unit.qualname, signal=sig), import_stmt
 
 
 class Applier:
     """把盲区函数补埋点提交到新建 git 分支（未提交，待人审）。"""
 
-    def apply(self, repo, units, branch: str, convention=None) -> ApplyResult:
+    def apply(self, repo, units, branch: str, convention=None, procedural=None) -> ApplyResult:
         repo = Path(repo).resolve()
         branch = (branch or "").strip()
         if not branch:
@@ -63,7 +74,7 @@ class Applier:
 
         result = ApplyResult(branch=branch, base_branch=base)
         self._git(repo, ["checkout", "-b", branch])
-        self._write_edits(repo, units, convention, result)
+        self._write_edits(repo, units, convention, procedural, result)
         self._git(repo, ["add", "-N", "."])
         result.diff = self._git(repo, ["diff"]).stdout
         result.message = (
@@ -72,7 +83,7 @@ class Applier:
         )
         return result
 
-    def _write_edits(self, repo: Path, units, convention, result: ApplyResult) -> None:
+    def _write_edits(self, repo: Path, units, convention, procedural, result: ApplyResult) -> None:
         by_file: dict = {}
         for u in units:
             by_file.setdefault(u.file, []).append(u)
@@ -84,7 +95,7 @@ class Applier:
             source = path.read_text(encoding="utf-8")
             changed = False
             for u in us:
-                snippet, import_stmt = _build_snippet(u, convention)
+                snippet, import_stmt = _build_snippet(u, convention, procedural)
                 new_source = insert_instrumentation(source, u.qualname, snippet, import_stmt)
                 if new_source is None:
                     result.skipped.append(u.unit_id)             # 改写不安全/找不到函数/已埋点
@@ -92,6 +103,14 @@ class Applier:
                 source = new_source
                 changed = True
                 result.units_fixed.append(u.unit_id)
+                # 程序性记忆：记住这次成功的补法（同类盲区下次可复用）。
+                if procedural is not None:
+                    from sentinel.engines.scan import signals_of
+                    sigs = signals_of(u)
+                    procedural.record_skill(
+                        getattr(u, "language", "") or "python",
+                        sigs[0] if sigs else "?",
+                        _DEFAULT_TEMPLATE, _DEFAULT_IMPORT)
             if changed:
                 path.write_text(source, encoding="utf-8")
                 result.files_changed.append(rel)

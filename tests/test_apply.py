@@ -69,3 +69,13 @@ def test_apply_rejects_existing_branch():
         assert False, "应因分支已存在而报错"
     except ApplyError as e:
         assert "已存在" in str(e) or "exists" in str(e)
+
+
+def test_apply_records_reusable_skill():
+    from sentinel.memory.procedural import ProceduralMemory
+    d = _make_repo()
+    pm = ProceduralMemory(str(Path(tempfile.mkdtemp()) / "sk.db"))
+    blind = scan_repo(str(d)).blind_spots
+    Applier().apply(str(d), blind, "sk", procedural=pm)
+    # checkin 触及 redis(cache) → 记录 (python, cache) 修复技能，供同类盲区复用
+    assert pm.get_skill("python", "cache") is not None
