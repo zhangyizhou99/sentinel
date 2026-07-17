@@ -14,6 +14,15 @@ from sentinel.llm import LLMClient
 from sentinel.engines.scan import scan_repo, signals_of
 from sentinel.memory import EpisodicMemory, IGNORE, INSTRUMENT
 
+
+def _register_languages() -> None:
+    """自动注册内置语言(js/ts/tsx)，让 CLI 扫描/补埋点也能识别前端文件（与 web 一致）。"""
+    try:
+        from sentinel.scanners.treesitter_scanner import register_builtin_languages
+        register_builtin_languages()
+    except Exception:  # noqa: BLE001
+        pass
+
 # 系统提示：定义这个 Agent 的身份。后续会逐步丰富。
 SYSTEM_PROMPT = "你是 Sentinel，一个可观测性守护 Agent 的雏形。用中文简洁回答。"
 
@@ -33,6 +42,7 @@ def cmd_scan(args: argparse.Namespace) -> None:
 
     带上情节记忆：抑制此前被标为「不用埋点」的函数（反馈学习），并记录本次运行。
     """
+    _register_languages()
     memory = EpisodicMemory()
     result = scan_repo(args.repo)
     spots = result.blind_spots
@@ -87,6 +97,7 @@ def cmd_apply(args: argparse.Namespace) -> None:
     from sentinel.engines.conventions import learn_and_store
     from sentinel.memory import NoteStore, ProceduralMemory
 
+    _register_languages()
     memory = EpisodicMemory()
     result = scan_repo(args.repo)
     ignored = memory.ignored_units(args.repo)

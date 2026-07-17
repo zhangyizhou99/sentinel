@@ -130,6 +130,29 @@ def language_pack_available() -> bool:
         return False
 
 
+# 有内置查询（编译验证过、不需 LLM）的语言：启动时自动注册，免得重启后要重新「装」。
+_BUILTIN_LANGUAGES = ("javascript", "typescript", "tsx")
+
+
+def register_builtin_languages() -> list:
+    """启动时自动注册内置查询的语言（js/ts/tsx）。
+
+    修复「重启后 ts/tsx 又不认识」：注册是进程内内存态，重启会丢；而这些语言的查询是内置的、
+    确定性的，language-pack 已装时应自动恢复注册，不该让用户每次重装。language-pack 不在则跳过。
+    """
+    if not language_pack_available():
+        return []
+    registered = []
+    for lang in _BUILTIN_LANGUAGES:
+        try:
+            if register_language(lang) is not None:
+                registered.append(lang)
+        except Exception:  # noqa: BLE001  某语言注册失败不影响其它
+            pass
+    return registered
+
+
+
 def install_language_support(language: str, llm=None) -> Dict[str, object]:
     """补齐某语言的解析能力（**破坏性**：可能 pip 安装，须人审后调用）。
 

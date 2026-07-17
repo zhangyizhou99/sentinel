@@ -871,10 +871,15 @@ def run(host: str = "127.0.0.1", port: int = 7860) -> None:
 
     @app.on_event("startup")
     def _warm_up() -> None:
-        """后台预热 embedder（首次会下载 ONNX 模型，同步做的话会卡住用户第一次点击）。
-
-        放进后台线程、不阻塞服务启动；判定时若还没预热完，_get_embedder() 会自己再等。
+        """启动预热：①自动注册内置语言(js/ts/tsx)（修「重启后 ts/tsx 又要重装」）；
+        ②后台预热 embedder（首次会下载 ONNX 模型，同步做会卡住用户第一次点击）。
         """
+        try:
+            from sentinel.scanners.treesitter_scanner import register_builtin_languages
+            register_builtin_languages()
+        except Exception:  # noqa: BLE001
+            pass
+
         import threading
 
         def _warm():
