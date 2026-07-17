@@ -81,6 +81,20 @@ def test_apply_records_reusable_skill():
     assert pm.get_skill("python", "cache") is not None
 
 
+def test_apply_follows_structlog_convention():
+    """apply 按项目约定风格补：structlog 项目 → 生成 structlog 埋点（入乡随俗）。"""
+    from sentinel.engines.conventions import InstrumentationConvention
+    d = _make_repo()
+    conv = InstrumentationConvention(repo=str(d), style="structlog",
+                                     top_calls=["log.info"], sample_count=3)
+    blind = scan_repo(str(d)).blind_spots
+    Applier().apply(str(d), blind, "sl", convention=conv)
+    txt = (d / "svc.py").read_text()
+    assert "import structlog" in txt
+    assert "structlog.get_logger().info" in txt
+    ast.parse(txt)
+
+
 def test_apply_tool_proposes_without_editing():
     """apply 工具是提议器：产出提议 + 建议分支名，但绝不直接改代码。"""
     from sentinel.engines.agent_tools import build_apply_tool

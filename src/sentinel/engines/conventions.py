@@ -91,3 +91,21 @@ def learn_and_store(repo: str, units: List[CodeUnit], notes) -> InstrumentationC
     conv = learn_convention(repo, units)
     store_convention(notes, conv)
     return conv
+
+
+# ---- 按项目风格生成埋点模板（入乡随俗）------------------------------------------
+# 都自包含（不依赖模块级 logger 变量），保证插入后一定能跑。
+# OTel/metrics 风格「一行」补不了（需 meter/tracer 脚手架）→ 退回安全 logging。
+_STYLE_TEMPLATES = {
+    "structlog": ("import structlog",
+                  'structlog.get_logger().info("sentinel: {qualname} touches {signal}")'),
+    "loguru": ("from loguru import logger",
+               'logger.info("sentinel: {qualname} touches {signal}")'),
+    "logging": ("import logging",
+                'logging.getLogger(__name__).info("sentinel: {qualname} touches {signal}")'),
+}
+
+
+def snippet_for_style(style: str):
+    """按项目埋点风格返回 (import_stmt, snippet_template)；未知/复杂风格退安全 logging。"""
+    return _STYLE_TEMPLATES.get(style, _STYLE_TEMPLATES["logging"])

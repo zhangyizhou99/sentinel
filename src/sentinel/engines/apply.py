@@ -32,28 +32,27 @@ class ApplyError(RuntimeError):
     """前置条件失败时抛出。"""
 
 
-_DEFAULT_TEMPLATE = 'logging.getLogger(__name__).info("sentinel: {qualname} touches {signal}")'
-_DEFAULT_IMPORT = "import logging"
-
-
 def _build_snippet(unit, convention=None, procedural=None):
-    """为一个盲区函数生成埋点行 + import。
+    """为盲区函数生成 (埋点行, import, 模板)。
 
-    优先查程序性记忆里同 (语言, 信号) 的修复技能模板（复用学到的补法）；
-    没有则用**自包含安全默认**（`logging.getLogger(__name__)`，不依赖模块级 logger 变量，
-    保证插入后一定能跑）。约定风格（structlog/otel）待模板从项目/反馈学到后再精确（DESIGN §8.2/8.3）。
+    优先级：① 程序性记忆里学到的修复技能模板；② 项目埋点约定风格（入乡随俗，
+    structlog/loguru/logging 各自的写法）；③ 复杂风格（OTel/metrics 一行补不了）退安全 logging。
+    模板一律自包含（不依赖模块级 logger 变量），保证插入后一定能跑。
     """
     from sentinel.engines.scan import signals_of
+    from sentinel.engines.conventions import snippet_for_style
     sigs = signals_of(unit)
     sig = "/".join(sigs) or "?"
     primary = sigs[0] if sigs else "?"
     lang = getattr(unit, "language", "") or "python"
-    template, import_stmt = _DEFAULT_TEMPLATE, _DEFAULT_IMPORT
     if procedural is not None:
         skill = procedural.get_skill(lang, primary)
         if skill:
-            template, import_stmt = skill.snippet_template, skill.import_stmt
-    return template.format(qualname=unit.qualname, signal=sig), import_stmt
+            return (skill.snippet_template.format(qualname=unit.qualname, signal=sig),
+                    skill.import_stmt, skill.snippet_template)
+    style = convention.style if (convention and getattr(convention, "found", False)) else "logging"
+    import_stmt, template = snippet_for_style(style)
+    return template.format(qualname=unit.qualname, signal=sig), import_stmt, template
 
 
 class Applier:
@@ -95,7 +94,7 @@ class Applier:
             source = path.read_text(encoding="utf-8")
             changed = False
             for u in us:
-                snippet, import_stmt = _build_snippet(u, convention, procedural)
+                snippet, import_stmt, template = _build_snippet(u, convention, procedural)
                 new_source = insert_instrumentation(source, u.qualname, snippet, import_stmt)
                 if new_source is None:
                     result.skipped.append(u.unit_id)             # 改写不安全/找不到函数/已埋点
@@ -103,14 +102,14 @@ class Applier:
                 source = new_source
                 changed = True
                 result.units_fixed.append(u.unit_id)
-                # 程序性记忆：记住这次成功的补法（同类盲区下次可复用）。
+                # 程序性记忆：记住这次成功的补法（按约定风格的模板，同类盲区下次可复用）。
                 if procedural is not None:
                     from sentinel.engines.scan import signals_of
                     sigs = signals_of(u)
                     procedural.record_skill(
                         getattr(u, "language", "") or "python",
                         sigs[0] if sigs else "?",
-                        _DEFAULT_TEMPLATE, _DEFAULT_IMPORT)
+                        template, import_stmt)
             if changed:
                 path.write_text(source, encoding="utf-8")
                 result.files_changed.append(rel)
