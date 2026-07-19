@@ -289,10 +289,20 @@ flowchart LR
 
 | 场景 | 每次调用 | provider 组合 |
 |---|---|---|
-| 每轮对话（plan/act 循环） | 每条消息 | `LastScan`(上次盲区) + `Note`(仓库约定) + `Conversation`(近期对话) |
+| 每轮对话（plan/act 循环） | 每条消息 | `Focus`(当前仓库) + `LastScan`(同仓库上次盲区) + `Note`(仓库约定) + `Conversation`(近期对话) |
 | 判定盲区（judge_intent） | 每个盲区函数 | `Target` + `History` + `Note` + `Peer` + `Knowledge` |
 
-`ContextTarget` 是通用的「上下文请求」（unit / repo / signals 给判定用；goal / turns / last_scan 给对话用），unit 相关 provider 在无 unit 时安全返回空。这样**预算、去重、分级压缩、溯源**这套纪律对每一次 LLM 调用统一生效——对话轮不再是「手拼字符串」，判定也不再特殊。`default_turn_builder` / `default_judge_builder` 两个工厂各配一套 provider。
+`ContextTarget` 是通用的「上下文请求」（unit / repo / signals 给判定用；goal / focus_repo / turns / last_scan 给对话用），unit 相关 provider 在无 unit 时安全返回空。这样**预算、去重、分级压缩、溯源**这套纪律对每一次 LLM 调用统一生效——对话轮不再是「手拼字符串」，判定也不再特殊。`default_turn_builder` / `default_judge_builder` 两个工厂各配一套 provider。
+
+#### 7.1.3 多轮仓库焦点：不能拿扫描快照代替对话指代
+
+- **真实症状**：用户先问 `haulhero-frontend` 最近一次 PR，GitHub MCP 正确返回 PR #1；下一句「那你扫一下这个仓库吧」却执行了 `scan(d:\Code\sentinel)`。
+- **根因**：Web 会话只保存 `last_scan`，同时把它当作「最近扫描结果」和「当前谈论仓库」。外部 GitHub 工具成功后不会产生新扫描快照，query rewrite 因而继续把旧 Sentinel 路径当成唯一可信仓库。
+- **修复**：独立维护 `focus_repo`。唯一 `find_repo` 结果、GitHub MCP 返回的 `local_repo` 和真实 scan 都可以更新焦点；`last_scan` 只保存盲区快照。焦点与快照仓库不一致时，仅向 ContextBuilder/query rewrite 注入新焦点，不继承旧语言缺口和盲区。
+- **验证**：新增 2 个状态回归测试，连同 MCP 适配测试窄跑 8/8 通过；真实两轮调用先得到 `zhangyizhou99/haulhero-frontend` PR #1（`feat: add selective frontend telemetry`），再返回对 `d:\Code\haulhero-frontend` 的扫描授权请求。
+- **剩余风险**：远程 GitHub 仓库若本地不存在，就没有可安全映射的扫描路径，后续指代应继续追问而非猜测；同名多仓库仍应依赖明确路径或唯一匹配。
+- **面试讲法**：把会话中的「对象身份」与「对象上的一次观测结果」分开建模。前者随成功工具调用推进，后者只在同一对象上作为证据复用，避免 stale context 劫持工具参数。
+- **可量化证据**：1 个独立焦点状态、3 类焦点来源（find/GitHub/scan）、2 个新增回归测试、1 条真实 MCP 两轮验收链路。
 
 ### 7.2 召回率怎么看（评估，第12章）
 - `eval/fixtures/*`：标注好「理想应监控的指标」的样例仓库 + `expected.json`。
