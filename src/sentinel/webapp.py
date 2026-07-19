@@ -8,10 +8,13 @@
 """
 from __future__ import annotations
 
+import html
+import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 from typing import List, Optional
 from urllib.parse import quote
 
@@ -35,17 +38,21 @@ try:  # pragma: no cover - 纯环境兜底
 except Exception:  # noqa: BLE001
     pass
 
-from sentinel.config import workspace_root
+from sentinel.config import LocalIdentity, workspace_root
 from sentinel.engines.agent import AgentCore, AgentRun
 from sentinel.engines.agent_tools import (
     build_find_repo_tool,
     build_scan_tool,
     build_check_language_tool,
     build_install_language_tool,
+    build_register_dynamic_language_tool,
     build_feedback_tool,
     build_note_tool,
     build_recall_notes_tool,
     build_apply_tool,
+    build_telemetry_plan_tool,
+    build_dashboard_tool,
+    build_deploy_dashboard_tool,
 )
 from sentinel.engines.scan import scan_repo, signals_of
 from sentinel.engines.judge import judge_intent
@@ -89,6 +96,22 @@ def _get_procedural():
         _PROCEDURAL = ProceduralMemory()
     return _PROCEDURAL
 
+
+# 本地协作原型：身份/工作区写入本地 SQLite；后续可替换为云端实现。
+_COLLABORATION = None
+
+
+def _get_collaboration(identity: Optional[LocalIdentity] = None):
+    global _COLLABORATION
+    identity = identity or LocalIdentity.from_env()
+    if _COLLABORATION is None:
+        from sentinel.memory import CollaborationStore
+        _COLLABORATION = CollaborationStore()
+    _COLLABORATION.ensure_user(identity.user_id, identity.display_name)
+    _COLLABORATION.ensure_workspace(identity.workspace_id, identity.workspace_name,
+                                    identity.user_id)
+    return _COLLABORATION
+
 # 意图判定用的向量索引 embedder 单例（避免每条消息重载模型）。
 _EMBEDDER = None
 
@@ -96,8 +119,8 @@ _EMBEDDER = None
 def _get_embedder():
     global _EMBEDDER
     if _EMBEDDER is None:
-        from sentinel.cognition import FastEmbedEmbedder
-        _EMBEDDER = FastEmbedEmbedder()
+        from sentinel.cognition import default_embedder
+        _EMBEDDER = default_embedder()
     return _EMBEDDER
 
 # 已授权可「打开文件」的路径集合（服务端级）。与 scan 授权一致：只有用户
@@ -122,11 +145,15 @@ def _build_agent(broker: PermissionBroker) -> AgentCore:
     scan = build_scan_tool(broker, memory=mem, notes=notes)  # 带记忆：抑制被拒的 + 记录运行 + 学埋点约定
     check = build_check_language_tool(broker)             # 只读：报告语言覆盖缺口
     install = build_install_language_tool(_LLM)           # 破坏性：须用户明确同意后才补齐
+    register_language = build_register_dynamic_language_tool(_LLM)
     ignore = build_feedback_tool(mem)                     # 反馈学习：标为不用埋点→下次抑制
     add_note = build_note_tool(notes, mem)               # 记团队笔记 → 判定上下文一等证据
     recall = build_recall_notes_tool(notes, mem)         # 查团队笔记
-    apply = build_apply_tool(broker, memory=mem, notes=notes, procedural=_get_procedural())  # 结构化执行器：LLM 填 targets/branch，直接补到新分支未提交
-    tools = {t.name: t for t in (find, scan, check, install, ignore, add_note, recall, apply)}
+    apply = build_apply_tool(broker, memory=mem, notes=notes, procedural=_get_procedural(), llm=_LLM)  # 结构化执行器：LLM 填 targets/branch，直接补到新分支未提交
+    telemetry_plan = build_telemetry_plan_tool(broker)
+    dashboard = build_dashboard_tool(broker)
+    deploy_dashboard = build_deploy_dashboard_tool()
+    tools = {t.name: t for t in (find, scan, check, install, register_language, ignore, add_note, recall, apply, telemetry_plan, dashboard, deploy_dashboard)}
     return AgentCore(_LLM, tools=tools)
 
 
@@ -144,17 +171,38 @@ def _scan_reports(run: AgentRun) -> List[dict]:
 
 
 def _open_link(repo: str, rel_file: str, lines: str) -> str:
-    """拼一个指向本机服务 /open 端点的相对链接。
+    """拼一个在新标签页打开的本机 /open 链接。
 
     为什么不用 vscode:// ：Gradio 前端会把非 http 的自定义协议链接过滤掉（点不动）。
     改成同源 http 链接就不会被清洗；点击时服务端用 code -g 打开（见 /open 路由）。
+    必须新开页面，避免 /open 成功页替换正在进行的 Sentinel 对话。
     """
     abspath = rel_file if os.path.isabs(rel_file) else os.path.join(repo or "", rel_file)
     start = str(lines or "1").split("-")[0].strip() or "1"
     return f"/open?path={quote(abspath)}&line={start}"
 
 
-def _open_in_editor(path: str, line: int) -> None:
+def _vscode_uri(path: str, line: int) -> str:
+    """构造跨平台的 VS Code 文件 URI，保留 Windows 盘符和路径分隔符。"""
+    normalized = os.path.abspath(path).replace("\\", "/")
+    return f"vscode://file/{quote(normalized, safe='/:')}:{max(1, int(line))}"
+
+
+def _code_executable() -> Optional[str]:
+    """定位 VS Code CLI 或 Windows 标准安装目录中的 Code.exe。"""
+    command = shutil.which("code")
+    if command:
+        return command
+    if os.name != "nt":
+        return None
+    candidates = [
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Microsoft VS Code", "Code.exe"),
+        os.path.join(os.environ.get("ProgramFiles", ""), "Microsoft VS Code", "Code.exe"),
+    ]
+    return next((candidate for candidate in candidates if os.path.isfile(candidate)), None)
+
+
+def _open_in_editor(path: str, line: int) -> tuple[bool, str]:
     """服务端在本机用 VS Code 打开文件到指定行。
 
     双重门（§14）：既要在工作区范围内，又要该目录**已被授权**（与 scan 一致）——
@@ -163,16 +211,30 @@ def _open_in_editor(path: str, line: int) -> None:
     root = workspace_root()
     ap = os.path.abspath(path)
     in_scope = ap == root or ap.startswith(root + os.sep)
-    if not (in_scope and _is_open_authorized(ap)) or not os.path.exists(ap):
-        return  # 越界 / 未授权 / 不存在 → 忽略，不打开
-    code = shutil.which("code")
+    if not in_scope:
+        return False, "文件超出允许范围。"
+    if not _is_open_authorized(ap):
+        return False, "该目录尚未获得扫描授权。"
+    if not os.path.exists(ap):
+        return False, "目标文件不存在。"
+    code = _code_executable()
     try:
-        if code:  # 有 code CLI 最直接
-            subprocess.run([code, "-g", f"{ap}:{line}"], check=False)
-        else:      # 否则 macOS 用 open 把 vscode:// URI 交给系统路由到 VS Code（无需 code 命令）
-            subprocess.run(["open", f"vscode://file{ap}:{line}"], check=False)
-    except Exception:  # noqa: BLE001
-        pass
+        if code:  # CLI 或 Code.exe 均支持 --goto，能直接聚焦编辑器与目标行。
+            result = subprocess.run([code, "--goto", f"{ap}:{line}"], check=False)
+            if result.returncode == 0:
+                return True, "已请求 VS Code 打开文件。"
+            return False, f"VS Code 命令退出码为 {result.returncode}。"
+
+        uri = _vscode_uri(ap, line)
+        if os.name == "nt":
+            os.startfile(uri)  # type: ignore[attr-defined]  # Windows 协议处理器
+        elif sys.platform == "darwin":
+            subprocess.run(["open", uri], check=True)
+        else:
+            subprocess.run(["xdg-open", uri], check=True)
+        return True, "已请求 VS Code 打开文件。"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"无法启动 VS Code：{exc}"
 
 
 def _language_gap_note(data: dict) -> str:
@@ -201,7 +263,8 @@ def _render_report(data: dict) -> str:
     for b in spots:
         sig = ", ".join(b.get("signals", [])) or "-"
         link = _open_link(repo, b.get("file", ""), b.get("lines", ""))
-        file_cell = f"[{b.get('file', '?')}]({link})"
+        file_name = html.escape(str(b.get("file", "?")))
+        file_cell = f'<a href="{link}" target="_blank" rel="noopener">{file_name}</a>'
         rows.append(f"| {file_cell} | `{b.get('function', '?')}` | {sig} | {b.get('lines', '?')} |")
     return head + "\n\n" + "\n".join(rows) + gap_note
 
@@ -217,7 +280,9 @@ def _summarize_obs(obs) -> str:
     if not isinstance(obs, dict):
         return _clip(obs)
     if "error" in obs:
-        return f"⚠️ {_clip(obs['error'])}"
+        call_id = obs.get("call_id")
+        suffix = f"（call_id: `{call_id}`）" if call_id else ""
+        return f"⚠️ {_clip(obs['error'])}{suffix}"
     res = obs.get("result", obs)
     if isinstance(res, dict):
         if "blind_spots" in res:
@@ -277,6 +342,35 @@ def _format_trace(run: AgentRun) -> str:
         L.append(f"**⚠️ 失败记录**：{len(run.failures)} 条（容错：记录但不阻断整体）")
 
     return "\n".join(L)
+
+
+def _format_injected_context(run: AgentRun) -> str:
+    """显示本轮压缩后实际传给 Agent 的上下文，便于诊断召回与指代问题。"""
+    context = (run.context or "").strip()
+    if not context:
+        context = "（本轮没有额外上下文。）"
+    # 防止上下文里的 Markdown 围栏提前结束当前代码块。
+    safe_context = context.replace("```", "``\u200b`")
+    return (
+        "<details><summary>🧩 实际注入 LLM 的上下文（压缩后，点击展开）</summary>\n\n"
+        "以下内容会作为 `CONTEXT` 拼入本轮 Agent 的系统提示：\n\n"
+        f"```text\n{safe_context}\n```\n"
+        "</details>"
+    )
+
+
+def _format_rewrite_trace(run: AgentRun) -> str:
+    """显示 LLM query rewrite 的事实输入、草案、原始输出和校验结果。"""
+    trace = run.rewrite_trace or {}
+    if not trace:
+        return ""
+    safe = json.dumps(trace, ensure_ascii=False, indent=2).replace("```", "``\u200b`")
+    return (
+        "<details><summary>🧭 Query rewrite 与约束校验（点击展开）</summary>\n\n"
+        "以下记录包含原始输入、允许使用的事实、确定性草案、LLM 原始 JSON，以及验证后的结果。\n\n"
+        f"```json\n{safe}\n```\n"
+        "</details>"
+    )
 
 
 def _judge_repo(repo: str, cap: int = 5):
@@ -366,7 +460,13 @@ def _format_run(run: AgentRun) -> str:
     elif not reports and not judge_main:
         parts.append(ans or "（没有得到结论）")
 
-    # 4) 学习层：三范式执行轨迹 + RAG/判定证据，可展开。
+    # 4) 诊断层：展示压缩后真实注入 LLM 的上下文，避免上下文丢失不可见。
+    rewrite = _format_rewrite_trace(run)
+    if rewrite:
+        parts.append(rewrite)
+    parts.append(_format_injected_context(run))
+
+    # 5) 学习层：三范式执行轨迹 + RAG/判定证据，可展开。
     trace = _format_trace(run)
     if judge_trace:
         trace = trace + "\n\n" + judge_trace
@@ -412,6 +512,45 @@ def _extract_path(message: str) -> Optional[str]:
         if os.path.exists(p):
             return p
     return None
+
+
+_EXPLICIT_SCAN = re.compile(
+    r"^\s*(?:扫(?:描)?(?:一下|下)?|scan)\s*[：:]?\s*`?"
+    r"(?P<query>[A-Za-z0-9_.-]+)`?\s*[。.!！]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _explicit_scan_query(message: str) -> Optional[str]:
+    """只识别无需语义推理的「扫描 + 明确项目名」请求。"""
+    match = _EXPLICIT_SCAN.fullmatch(message or "")
+    return match.group("query") if match else None
+
+
+def _fast_scan_request(state: dict, message: str):
+    """明确扫描意图走本地查找与权限门，避免授权前多次 LLM 往返。"""
+    query = _explicit_scan_query(message)
+    if not query:
+        return None
+    broker: PermissionBroker = state["broker"]
+    state["goal"] = message
+    result = build_find_repo_tool(broker).func(query)
+    matches = result.get("matches", []) if isinstance(result, dict) else []
+    if not matches:
+        return (
+            f"未在允许范围 `{broker.root}` 内找到项目 `{query}`。",
+            [],
+            [],
+        )
+    if len(matches) > 1:
+        return _format_permission_request(matches, broker, matches), matches, matches
+    target = matches[0]
+    scan_result = build_scan_tool(broker).func(target)
+    if scan_result.get("permission_required"):
+        return _format_permission_request([target], broker), [target], []
+    if scan_result.get("denied"):
+        return _format_denied([target], broker), [], []
+    return _format_scan_result(target), [], []
 
 
 # -- 授权回合：识别同意/拒绝、收集待授权请求 --------------------------------
@@ -555,6 +694,10 @@ def _ensure(state) -> dict:
         state["pending"] = []
         state["candidates"] = []
         state["goal"] = None
+    if "identity" not in state:
+        identity = LocalIdentity.from_env()
+        _get_collaboration(identity)
+        state["identity"] = identity
     state.setdefault("pending_apply", None)
     return state
 
@@ -583,6 +726,7 @@ def _stash_scan(state: dict, report) -> None:
         return
     state["last_scan"] = {
         "repo": report.get("repo", ""),
+        "language_gap": report.get("language_gap") or {},
         "spots": [
             {"unit_id": b.get("unit_id") or f"{b.get('file')}::{b.get('function')}",
              "function": b.get("function", ""),
@@ -595,7 +739,7 @@ def _stash_scan(state: dict, report) -> None:
 def _stash_scan_from_run(state: dict, run: AgentRun) -> None:
     """从一次 agent run 的 transcript 里取最后一份扫描报告，存快照。"""
     for rep in reversed(_scan_reports(run)):
-        if isinstance(rep, dict) and rep.get("blind_spots"):
+        if isinstance(rep, dict) and "blind_spots" in rep:
             _stash_scan(state, rep)
             return
 
@@ -608,7 +752,7 @@ def _recent_context(chat, state: dict, max_turns: int = 4) -> str:
     """
     from sentinel.cognition.context_builder import ContextTarget, default_turn_builder
     last = state.get("last_scan")
-    turns = [(m["role"], m.get("content", ""))
+    turns = [(m["role"], _message_text(m.get("content")))
              for m in (chat or []) if m.get("role") in ("user", "assistant")][:-1]
     repo = (last or {}).get("repo", "")
     target = ContextTarget(repo=repo, turns=turns[-max_turns:], last_scan=last)
@@ -632,6 +776,15 @@ def _format_applied(a: dict) -> str:
         lines.append(f"已补 {len(a['units_fixed'])} 个：{', '.join(a['units_fixed'])}")
     if a.get("skipped"):
         lines.append(f"⏭ 跳过 {len(a['skipped'])} 个（非 Python / 改写不安全）")
+    if a.get("emitter"):
+        configured = a.get("receiver_configured")
+        receiver = "已检测到配置" if configured is True else (
+            "未检测到配置" if configured is False else "未验证")
+        lines.append(
+            f"遥测状态：emitter=`{a['emitter']}`；Receiver={receiver}；"
+            f"delivery=`{a.get('delivery', 'unverified')}`")
+    if a.get("delivery_note"):
+        lines.append(a["delivery_note"])
     diff = a.get("diff", "")
     if diff:
         lines.append(f"\n```diff\n{diff}\n```")
@@ -666,7 +819,7 @@ def _do_apply(repo: str, branch: str) -> str:
         return "没有需要补埋点的盲区了。"
     conv = learn_convention(repo, result.units)
     try:
-        res = Applier().apply(repo, spots, branch, convention=conv, procedural=_get_procedural())
+        res = Applier(llm=_LLM).apply(repo, spots, branch, convention=conv, procedural=_get_procedural())
     except ApplyError as e:
         return (f"❌ 无法补埋点：{e}\n\n"
                 "（apply 需要一个干净的 git 仓库；想换分支名可以再说「补一下」并指定名字。）")
@@ -675,6 +828,14 @@ def _do_apply(repo: str, branch: str) -> str:
         lines.append(f"已补 {len(res.units_fixed)} 个：{', '.join(res.units_fixed)}")
     if res.skipped:
         lines.append(f"⏭ 跳过 {len(res.skipped)} 个（非 Python / 改写不安全）")
+    if res.emitter:
+        receiver = "已检测到配置" if res.receiver_configured is True else (
+            "未检测到配置" if res.receiver_configured is False else "未验证")
+        lines.append(
+            f"遥测状态：emitter=`{res.emitter}`；Receiver={receiver}；"
+            f"delivery=`{res.delivery}`")
+    if res.delivery_note:
+        lines.append(res.delivery_note)
     lines.append(f"\n```diff\n{(res.diff or '(无 diff)')[:2500]}\n```")
     return "\n".join(lines)
 
@@ -693,7 +854,7 @@ def _handle_apply_reply(state: dict, msg: str) -> str:
     return _do_apply(prop.get("repo", ""), branch)
 
 
-def _agent_turn(state: dict, goal: str, context: str = ""):
+def _agent_turn(state: dict, goal: str, context: str = "", rewrite_trace: Optional[dict] = None):
     """跑一次 agent，返回 (回复文本, 待授权路径, 候选路径)。
 
     context：会话背景（近期对话 + 上次扫描盲区），让「把这个忽略」这类指代能解析。
@@ -714,7 +875,19 @@ def _agent_turn(state: dict, goal: str, context: str = ""):
             return note + f"⚠️ `{path}` 超出允许范围（{broker.root}）。", [], []
         return note + f"给我一个（{broker.root} 内的）仓库路径或项目名。", [], []
 
-    run = _build_agent(broker).run(goal=goal, context=context)
+    try:
+        run = _build_agent(broker).run(goal=goal, context=context)
+    except Exception as exc:  # LLM 服务可能在启动后断开，不能让 Gradio 回调崩溃。
+        base_url = getattr(_LLM.config, "base_url", "")
+        return (
+            "⚠️ 无法连接 LLM 服务，当前请求没有执行。\n\n"
+            f"原因：`{type(exc).__name__}: {exc}`\n\n"
+            f"请确认本地 Copilot API 代理正在运行：`{base_url}`。\n"
+            "启动后可直接重新发送这条消息。",
+            [],
+            [],
+        )
+    run.rewrite_trace = rewrite_trace or {}
     _stash_scan_from_run(state, run)                       # 记下本轮扫描盲区，供下一轮指代
     pending = _collect(run, "permission_required")
     if pending:
@@ -751,10 +924,21 @@ def _approve(state: dict, selected: Optional[str]):
     return _format_scan_result(target)  # 兜底
 
 
-def _ui_add_user(message: str, chat):
+def _message_text(content) -> str:
+    """把 Gradio 6 的富文本 content 规范为普通文本，供 Agent 与状态机使用。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        return str(content.get("text") or content.get("content") or "")
+    if isinstance(content, (list, tuple)):
+        return "\n".join(_message_text(item) for item in content).strip()
+    return str(content or "")
+
+
+def _ui_add_user(message, chat):
     """第一步（秒回）：立刻把用户消息显示到聊天区并清空输入框。"""
     chat = list(chat or [])
-    msg = (message or "").strip()
+    msg = _message_text(message).strip()
     if msg:
         chat.append({"role": "user", "content": msg})
     return chat, ""
@@ -765,9 +949,9 @@ def _ui_bot(chat, state):
     state = _ensure(state)
     chat = list(chat or [])
     if not chat or chat[-1].get("role") != "user":
-        return chat, *_controls(state.get("pending"), state.get("candidates")), \
+        return chat, state, *_controls(state.get("pending"), state.get("candidates")), \
             *_ignore_controls(state)
-    msg = chat[-1]["content"]
+    msg = _message_text(chat[-1].get("content")).strip()
 
     # 有待授权时，也支持打字「同意/取消」（与按钮等效）。
     if state.get("pending") and _is_affirmative(msg):
@@ -779,22 +963,31 @@ def _ui_bot(chat, state):
     else:
         state["pending"] = []
         state["candidates"] = []
-        ctx = _recent_context(chat, state)               # 会话背景（上次扫描 + 近期对话）
-        reply, pending, candidates = _agent_turn(state, msg, context=ctx)
+        fast_scan = _fast_scan_request(state, msg)
+        if fast_scan is not None:
+            reply, pending, candidates = fast_scan
+        else:
+            ctx = _recent_context(chat, state)           # 会话背景（上次扫描 + 近期对话）
+            from sentinel.cognition.query_rewrite import render_rewrite_context, rewrite_query
+            rewrite = rewrite_query(_LLM, msg, state.get("last_scan"))
+            ctx = "\n\n".join(part for part in (ctx, render_rewrite_context(rewrite)) if part)
+            reply, pending, candidates = _agent_turn(
+                state, msg, context=ctx, rewrite_trace=rewrite.to_dict())
         state["pending"] = pending
         state["candidates"] = candidates
 
     chat.append({"role": "assistant", "content": reply})
-    return chat, *_controls(pending, candidates), *_ignore_controls(state)
+    return chat, state, *_controls(pending, candidates), *_ignore_controls(state)
 
 
 def _ui_approve(chat, state, selected):
     state = _ensure(state)
     chat = list(chat or [])
     reply = _approve(state, selected)
-    chat.append({"role": "user", "content": f"✅ 同意扫描 `{selected or (state.get('goal') or '')}`"})
+    goal = _message_text(state.get("goal")).strip()
+    chat.append({"role": "user", "content": f"✅ 同意扫描 `{selected or goal}`"})
     chat.append({"role": "assistant", "content": reply})
-    return chat, *_controls([], []), *_ignore_controls(state)
+    return chat, state, *_controls([], []), *_ignore_controls(state)
 
 
 def _ui_deny(chat, state):
@@ -804,7 +997,7 @@ def _ui_deny(chat, state):
     state["candidates"] = []
     chat.append({"role": "user", "content": "❌ 取消"})
     chat.append({"role": "assistant", "content": "好的，已取消，不读取该目录。"})
-    return chat, *_controls([], []), *_ignore_controls(state)
+    return chat, state, *_controls([], []), *_ignore_controls(state)
 
 
 def _ui_ignore(chat, state, selected):
@@ -825,23 +1018,27 @@ def _ui_ignore(chat, state, selected):
         chat.append({"role": "user", "content": f"🚫 忽略 {len(picks)} 个函数"})
         chat.append({"role": "assistant",
                      "content": f"已把 {names} 标记为「不用埋点」，下次扫描将自动抑制（反馈学习）。"})
-    return chat, *_controls([], []), *_ignore_controls(state)
+    return chat, state, *_controls([], []), *_ignore_controls(state)
 
 
 def build_demo() -> "gr.Blocks":
     """自定义 Blocks 界面：对话 + 授权按钮 + 多候选单选 + 结果可点击跳 VS Code。"""
     root = workspace_root()
+    identity = LocalIdentity.from_env()
+    _get_collaboration(identity)
     status = "✅ 已连接 LLM" if _LLM.available else "⚠️ 纯扫描模式（未配 LLM key）"
 
     with gr.Blocks(title="Sentinel · 可观测性守护 Agent") as demo:
         gr.Markdown(
             f"# 🛡️ Sentinel · 可观测性守护 Agent\n"
             f"读懂代码、找出监控盲区（调了依赖却没埋点的函数）。当前状态：{status}。\n"
+            f"本地协作身份：`{identity.display_name}` (`{identity.user_id}`)；"
+            f"工作区：`{identity.workspace_name}` (`{identity.workspace_id}`)。\n"
             f"允许范围：`{root}`。只给项目名也行，我会先找路径、再请你**授权**后扫描；"
             "结果里的文件名可**点击在 VS Code 打开**。"
         )
         state = gr.State({})
-        chatbot = gr.Chatbot(type="messages", height=440, label="Sentinel", show_copy_button=True)
+        chatbot = gr.Chatbot(height=440, label="Sentinel", buttons=["copy"])
         cand_radio = gr.Radio(choices=[], visible=False, label="找到多个匹配，选一个授权：")
         with gr.Row():
             approve_btn = gr.Button("✅ 同意扫描", variant="primary", visible=False)
@@ -854,7 +1051,7 @@ def build_demo() -> "gr.Blocks":
             msg = gr.Textbox(placeholder="扫一下 sentinel-sample-app", show_label=False, scale=8, autofocus=True)
             send = gr.Button("发送", variant="primary", scale=1)
 
-        outs_btn = [chatbot, cand_radio, approve_btn, deny_btn, ignore_dd, ignore_btn]
+        outs_btn = [chatbot, state, cand_radio, approve_btn, deny_btn, ignore_dd, ignore_btn]
         # 两步：先秒回显示用户消息+清空输入框，再 .then() 跑 agent 补回复。
         add_io = ([msg, chatbot], [chatbot, msg])
         send.click(_ui_add_user, *add_io, api_name=False).then(
@@ -873,14 +1070,23 @@ def run(host: str = "127.0.0.1", port: int = 7860) -> None:
     """启动：把 Gradio 挂在自建 FastAPI 上，额外提供 /open 端点（点文件名打开 VS Code）。"""
     import uvicorn
     from fastapi import FastAPI, Response
+    from fastapi.responses import HTMLResponse
 
     app = FastAPI()
 
     @app.get("/open")
     def _open(path: str, line: int = 1):  # noqa: ANN202
-        _open_in_editor(path, line)
-        # 204 No Content：点链接后浏览器不跳转、对话不丢，只默默打开编辑器。
-        return Response(status_code=204)
+        opened, message = _open_in_editor(path, line)
+        if opened:
+            return HTMLResponse(
+                "<!doctype html><title>Opening file</title>"
+                "<script>window.close()</script>"
+                "<p>已请求在 VS Code 中打开文件；此临时页可以关闭。</p>"
+            )
+        return HTMLResponse(
+            f"<p>无法打开文件：{message}</p><p><a href='/'>返回 Sentinel</a></p>",
+            status_code=400,
+        )
 
     @app.on_event("startup")
     def _warm_up() -> None:

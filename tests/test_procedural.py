@@ -27,3 +27,13 @@ def test_skills_keyed_by_language_and_signal():
     assert pm.get_skill("python", "http").snippet_template == "a"
     assert pm.get_skill("python", "cache").snippet_template == "b"
     assert pm.get_skill("typescript", "http") is None     # 语言不匹配
+
+
+def test_record_skill_normalizes_optional_import_to_empty_string():
+    pm = ProceduralMemory(os.path.join(tempfile.mkdtemp(), "p.db"))
+
+    pm.record_skill("typescript", "http", 'console.info("{qualname}")', None)
+
+    skill = pm.get_skill("typescript", "http")
+    assert skill is not None
+    assert skill.import_stmt == ""

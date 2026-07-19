@@ -67,6 +67,20 @@ def test_judge_degrades_without_llm():
     assert any(e.startswith("knowledge:") for e in v.evidence)
 
 
+def test_judge_degrades_when_llm_call_fails(caplog):
+    class FailingLLM(StubLLM):
+        def complete(self, system, user):
+            raise RuntimeError("500 fetch failed")
+
+    v = judge_intent(_BLIND, None, FailingLLM())
+
+    assert v.status == "llm_unavailable"
+    assert v.verdict == "instrument"
+    assert v.suggestions
+    assert "LLM 调用失败" in v.reason
+    assert "judge LLM call failed" in caplog.text
+
+
 def test_peers_only_instrumented_and_not_self():
     idx = CodeIndex(embedder=HashEmbedder(dim=128), store=MemoryStore(128))
     peer_ok = _unit("get_cached_user", ["redis.get"], instrumented=True, doc="read user cache")

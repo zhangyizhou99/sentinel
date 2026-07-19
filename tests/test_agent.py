@@ -8,11 +8,19 @@
 运行：PYTHONPATH=src pytest tests/ -q
 """
 import sys
+import json
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from sentinel.engines.agent import AgentCore, AgentRun, Tool  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _isolated_tool_call_log(tmp_path, monkeypatch):
+    monkeypatch.setenv("SENTINEL_TOOL_CALL_LOG", str(tmp_path / "tool-calls.jsonl"))
 
 
 class _StubLLM:
@@ -189,6 +197,57 @@ def test_run_tool_error_recorded_not_crash():
     run = core.run("试试")
     assert run.answer == "出错了但我没崩"
     assert run.failures and "error" in run.failures[0]
+
+
+def test_tool_exception_writes_traceback_and_redacts_secrets(tmp_path, monkeypatch):
+    log_path = tmp_path / "tool-calls.jsonl"
+    monkeypatch.setenv("SENTINEL_TOOL_CALL_LOG", str(log_path))
+
+    def boom(_):
+        raise TypeError("'NoneType' object is not subscriptable")
+
+    core = AgentCore(_StubLLM([]), tools={"boom": Tool("boom", "会抛错", boom)})
+    observation = core._run_tool("boom", {"repo": "d:/Code/app", "token": "secret"})
+
+    records = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert observation["call_id"] == records[-1]["call_id"]
+    assert records[0]["input"]["token"] == "<redacted>"
+    assert records[-1]["status"] == "exception"
+    assert "Traceback (most recent call last)" in records[-1]["traceback"]
+    assert "NoneType" in records[-1]["traceback"]
+
+
+def test_tool_business_error_is_recorded_as_failure(tmp_path, monkeypatch):
+    log_path = tmp_path / "tool-calls.jsonl"
+    monkeypatch.setenv("SENTINEL_TOOL_CALL_LOG", str(log_path))
+    core = AgentCore(
+        _StubLLM([]),
+        tools={"reject": Tool("reject", "返回业务错误", lambda _: {"error": "没找到盲区"})},
+    )
+
+    observation = core._run_tool("reject", "queue.ts")
+
+    assert observation["error"] == "没找到盲区"
+    assert observation["result"] == {"error": "没找到盲区"}
+    record = json.loads(log_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert record["status"] == "error"
+
+
+def test_run_stops_after_successful_apply_without_model_reinterpretation():
+    llm = _ChatStub([
+        _Msg(tool_calls=[_tc("apply_instrumentation", '{"input": "queue.ts"}')]),
+        _Msg(content="错误地说没有匹配项"),
+    ])
+    tool = Tool(
+        "apply_instrumentation",
+        "补埋点",
+        lambda _: {"applied": {"message": "已补 4 个埋点", "units_fixed": ["a", "b", "c", "d"]}},
+    )
+
+    run = AgentCore(llm, tools={tool.name: tool}).run("补 queue.ts")
+
+    assert run.answer == "已补 4 个埋点"
+    assert llm.calls == 1
 
 
 def test_run_respects_max_steps():

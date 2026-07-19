@@ -68,6 +68,12 @@ def scan_file(path: str, rel_path: str) -> List[CodeUnit]:
 
 def scan_repo(repo_path: str) -> ScanResult:
     """扫描整个仓库（或单个文件）。只处理有对应语言解析器的文件。"""
+    # 直接 API/CLI 调用也必须和 Web 一致，不能因未预注册静默漏掉前端源码。
+    try:
+        from sentinel.scanners.treesitter_scanner import register_builtin_languages
+        register_builtin_languages()
+    except Exception:  # noqa: BLE001
+        pass
     result = ScanResult(repo=repo_path)
     if os.path.isfile(repo_path):
         result.units.extend(scan_file(repo_path, os.path.basename(repo_path)))

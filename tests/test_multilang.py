@@ -85,6 +85,15 @@ def test_signal_words_are_language_scoped():
     assert "http" in signals_in_calls(["fetch"], "")
 
 
+def test_faro_is_instrumentation_but_console_info_is_not():
+    """只有可投递的 Faro 调用算遥测；普通控制台输出不能掩盖盲区。"""
+    from sentinel.scanners.instrumentation import has_instrumentation
+
+    assert has_instrumentation("recordObservability('queue.flush', 'http')", "typescript")
+    assert has_instrumentation("faro.api.pushEvent('queue.flush')", "typescript")
+    assert not has_instrumentation("console.info('[sentinel] queue.flush')", "typescript")
+
+
 def test_install_language_support_ok():
     res = install_language_support("tsx")                       # 环境已装 language-pack
     assert res["ok"] is True
@@ -93,6 +102,23 @@ def test_install_language_support_ok():
 
 def test_build_scanner_unknown_language_returns_none():
     assert build_scanner("klingon") is None                     # 拿不到查询
+
+
+def test_dynamic_extension_mapping_registers_after_query_validation(tmp_path, monkeypatch):
+    from sentinel.scanners import base
+    from sentinel.scanners import catalog
+    from sentinel.scanners.treesitter_scanner import register_dynamic_language_support
+
+    registry_before = dict(base._REGISTRY)
+    monkeypatch.setattr(catalog, "_DYNAMIC_CATALOG_PATH", str(tmp_path / "languages.json"))
+    try:
+        result = register_dynamic_language_support("typescript", [".feature"], llm=None)
+        assert result["ok"] is True
+        assert catalog.language_for_ext(".feature") == "typescript"
+        assert catalog.extensions_for_language("typescript").count(".feature") == 1
+    finally:
+        base._REGISTRY.clear()
+        base._REGISTRY.update(registry_before)
 
 
 def test_check_language_tool_reports_gap():

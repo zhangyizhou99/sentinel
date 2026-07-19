@@ -28,7 +28,7 @@ SRC_NOTE = "note"
 SRC_PEER = "peer"
 SRC_KNOWLEDGE = "knowledge"
 SRC_FOCUS = "focus"              # 对话级：当前焦点仓库（指代消解，如「再扫一遍」）
-SRC_SCAN = "scan"                # 对话级：上次扫描的盲区快照
+SRC_SCAN = "scan"                # 对话级：上次扫描的盲区与语言缺口
 SRC_RUNS = "runs"                # 对话级：跨会话的历史扫描记录（情节记忆）
 SRC_CONVERSATION = "conversation"  # 对话级：近期对话
 _RENDER_ORDER = [SRC_TARGET, SRC_FOCUS, SRC_SCAN, SRC_RUNS, SRC_HISTORY, SRC_NOTE, SRC_PEER,
@@ -41,7 +41,7 @@ _SRC_HEADER = {
     SRC_PEER: "[PEERS] 同仓库已埋点的相似函数 | similar already-instrumented peers",
     SRC_KNOWLEDGE: "[KNOWLEDGE] RED/USE 经验 | RED/USE knowledge",
     SRC_FOCUS: "[FOCUS] 当前对话焦点 | current conversation focus",
-    SRC_SCAN: "[LAST SCAN] 上次扫描的盲区 | blind spots from last scan",
+    SRC_SCAN: "[LAST SCAN] 上次扫描结果 | blind spots and language gaps from last scan",
     SRC_RUNS: "[PAST SCANS] 历史扫描记录（跨会话）| past scans across sessions",
     SRC_CONVERSATION: "[CONVERSATION] 近期对话 | recent conversation",
 }
@@ -449,20 +449,35 @@ class FocusProvider(EvidenceProvider):
 
 
 class LastScanProvider(EvidenceProvider):
-    """上次扫描的盲区快照：让「把这个忽略」这类指代有据可依（含 unit_id）。"""
+    """上次扫描结果：盲区与语言缺口都必须成为下一轮可引用的上下文证据。"""
 
     def provide(self, target: ContextTarget) -> List[ContextSection]:
         ls = target.last_scan
-        if not ls or not ls.get("spots"):
+        if not ls:
             return []
-        lines = [f"上次扫描仓库 | repo: {ls.get('repo', '')}",
-                 "盲区（用户说「忽略/这个不用/不用加」通常指这些，请对相应 unit_id 调 ignore_finding）:"]
-        for s in ls["spots"][:10]:
-            sig = ", ".join(s.get("signals", [])) or "-"
-            lines.append(f"  - {s['unit_id']} [{sig}]")
+        spots = ls.get("spots") or []
+        gap = ls.get("language_gap") or {}
+        if not spots and not gap:
+            return []
+
+        lines = [f"上次扫描仓库 | repo: {ls.get('repo', '')}"]
+        compact_parts = []
+        if spots:
+            lines.append("盲区（用户说「忽略/这个不用/不用加」通常指这些，请对相应 unit_id 调 ignore_finding）:")
+            for s in spots[:10]:
+                sig = ", ".join(s.get("signals", [])) or "-"
+                lines.append(f"  - {s['unit_id']} [{sig}]")
+            compact_parts.append("盲区: " + ", ".join(s["unit_id"] for s in spots[:10]))
+        if gap:
+            languages = "、".join(f"{language}({count} 文件)" for language, count in gap.items())
+            lines.extend([
+                f"语言缺口：{languages} 因缺少解析器未被扫描。",
+                "若用户表达同意补齐/安装这些语言支持，应调用 install_language_support（逐个语言）；"
+                "该操作可能安装依赖，只有明确同意时才执行。成功后可对上述 repo 再调用 scan。",
+            ])
+            compact_parts.append(f"语言缺口: {languages}；获同意后 install_language_support，再 scan")
         full = "\n".join(lines)
-        compact = "上次盲区 | last blind spots: " + ", ".join(
-            s["unit_id"] for s in ls["spots"][:10])
+        compact = "上次扫描 | " + "；".join(compact_parts)
         return [ContextSection(SRC_SCAN, "last scan", full, priority=88,
                                ref="", compact=compact, min_chars=20)]
 

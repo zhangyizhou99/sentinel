@@ -92,3 +92,58 @@ def insert_instrumentation(source: str, qualname: str, snippet: str,
     except SyntaxError:
         return None
     return new_source
+
+
+def insert_js_import(source: str, import_stmt: str) -> str:
+    """在首个现有 import 前加入一条 JS/TS import；已存在时保持不变。"""
+    if not import_stmt or import_stmt in source:
+        return source
+    lines = source.splitlines()
+    import_index = next(
+        (index for index, line in enumerate(lines) if line.lstrip().startswith("import ")),
+        0,
+    )
+    lines.insert(import_index, import_stmt)
+    return "\n".join(lines) + ("\n" if source.endswith("\n") else "")
+
+
+def insert_js_instrumentation(source: str, start_line: int, end_line: int,
+                              snippet: str, import_stmt: Optional[str] = None) -> Optional[str]:
+    """在已被 tree-sitter 定位的 JS/TS 函数体首行插入一条埋点。
+
+    不重排代码，也不引入日志库。只接受函数范围内独占一行的开括号，避免对单行函数、
+    复杂表达式函数或无法可靠判定的源码做猜测性改写。
+    """
+    lines = source.splitlines()
+    lower = max(0, start_line - 1)
+    upper = min(len(lines), max(lower, end_line))
+    if lower >= upper:
+        return None
+    function_text = "\n".join(lines[lower:upper])
+    if "sentinel: observability" in function_text:
+        return None
+
+    opening_index = None
+    for index in range(lower, upper):
+        before, marker, after = lines[index].partition("{")
+        if not marker:
+            continue
+        # 仅处理 `{` 后没有同一行语句的函数体，保证插入点仍在函数内部。
+        tail = after.strip()
+        if tail and not tail.startswith("//") and not tail.startswith("/*"):
+            continue
+        opening_index = index
+        break
+    if opening_index is None:
+        return None
+
+    indent = len(lines[opening_index]) - len(lines[opening_index].lstrip()) + 2
+    for candidate in lines[opening_index + 1:upper]:
+        if candidate.strip():
+            indent = len(candidate) - len(candidate.lstrip())
+            break
+    lines.insert(opening_index + 1, " " * indent + "// sentinel: observability")
+    lines.insert(opening_index + 2, " " * indent + snippet)
+
+    updated = "\n".join(lines) + ("\n" if source.endswith("\n") else "")
+    return insert_js_import(updated, import_stmt or "")

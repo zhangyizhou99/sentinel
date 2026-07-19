@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import os
+import json
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, List
@@ -34,6 +35,33 @@ EXT_TO_LANGUAGE: Dict[str, str] = {
     ".cc": "cpp", ".cpp": "cpp", ".cxx": "cpp", ".hpp": "cpp",
 }
 
+_DYNAMIC_CATALOG_PATH = os.path.expanduser("~/.cache/sentinel/language_extensions.json")
+
+
+def _dynamic_mappings() -> Dict[str, str]:
+    try:
+        with open(_DYNAMIC_CATALOG_PATH, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return {str(ext).lower(): str(language).lower() for ext, language in data.items()
+                if str(ext).startswith(".") and str(language)}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def register_language_extensions(language: str, extensions: List[str]) -> Dict[str, str]:
+    """持久化用户确认的扩展名 -> tree-sitter 语言映射。"""
+    language = (language or "").strip().lower()
+    normalized = [ext.lower() if ext.startswith(".") else f".{ext.lower()}"
+                  for ext in extensions if str(ext).strip()]
+    if not language or not normalized:
+        raise ValueError("需要语言名和至少一个扩展名")
+    mapping = _dynamic_mappings()
+    mapping.update({ext: language for ext in normalized})
+    os.makedirs(os.path.dirname(_DYNAMIC_CATALOG_PATH), exist_ok=True)
+    with open(_DYNAMIC_CATALOG_PATH, "w", encoding="utf-8") as handle:
+        json.dump(mapping, handle, ensure_ascii=False, indent=2, sort_keys=True)
+    return {ext: language for ext in normalized}
+
 # 与 scan.py 保持一致的跳过目录。
 _SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__",
               "dist", "build", ".mypy_cache", ".pytest_cache", "site-packages",
@@ -42,7 +70,8 @@ _SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__",
 
 def language_for_ext(ext: str) -> str:
     """扩展名 → 语言名（未知返回空串）。"""
-    return EXT_TO_LANGUAGE.get(ext.lower(), "")
+    normalized = ext.lower()
+    return EXT_TO_LANGUAGE.get(normalized, _dynamic_mappings().get(normalized, ""))
 
 
 @dataclass
@@ -96,4 +125,5 @@ def analyze_repo(root: str) -> LanguageGap:
 
 def extensions_for_language(language: str) -> List[str]:
     """反查：某语言对应哪些扩展名（注册解析器时用）。"""
-    return [ext for ext, lang in EXT_TO_LANGUAGE.items() if lang == language]
+    known = {**EXT_TO_LANGUAGE, **_dynamic_mappings()}
+    return [ext for ext, lang in known.items() if lang == language]

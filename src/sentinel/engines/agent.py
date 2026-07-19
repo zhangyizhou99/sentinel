@@ -12,13 +12,61 @@
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
+import logging
+import os
 import re
+import threading
+import time
+import traceback
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+from sentinel.config import tool_call_log_path
+
 # 反思达标线：>= 此分即“足够好，停止”。
 _GOOD_ENOUGH = 8
+_TOOL_LOG_LOCK = threading.Lock()
+_TOOL_LOGGER = logging.getLogger("sentinel.tool_calls")
+_SENSITIVE_KEY = re.compile(
+    r"(?:api[_-]?key|authorization|cookie|password|secret|token)", re.IGNORECASE)
+
+
+def _audit_value(value: Any, depth: int = 0) -> Any:
+    """生成有大小上限的日志副本，并按字段名脱敏常见凭据。"""
+    if depth >= 5:
+        return "<max-depth>"
+    if isinstance(value, dict):
+        return {
+            str(key): ("<redacted>" if _SENSITIVE_KEY.search(str(key))
+                       else _audit_value(item, depth + 1))
+            for key, item in list(value.items())[:50]
+        }
+    if isinstance(value, (list, tuple)):
+        return [_audit_value(item, depth + 1) for item in list(value)[:50]]
+    if isinstance(value, str):
+        return value if len(value) <= 4000 else value[:4000] + "<truncated>"
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return repr(value)[:4000]
+
+
+def _write_tool_audit(event: Dict[str, Any]) -> None:
+    """尽力写入一行审计日志；日志故障不能影响 Agent 主流程。"""
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        **event,
+    }
+    try:
+        path = tool_call_log_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        line = json.dumps(record, ensure_ascii=False, default=repr)
+        with _TOOL_LOG_LOCK, open(path, "a", encoding="utf-8") as stream:
+            stream.write(line + "\n")
+    except Exception:  # noqa: BLE001
+        _TOOL_LOGGER.exception("failed to write tool audit log")
 
 
 # -- 工具抽象 --------------------------------------------------------------
@@ -125,12 +173,14 @@ class AgentRun:
     answer: str = ""
     rounds: int = 0
     context: str = ""  # 会话背景（近期对话 + 上次扫描），让多轮指代能解析
+    rewrite_trace: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
             "goal": self.goal, "plan": self.plan, "transcript": self.transcript,
             "reflections": self.reflections, "failures": self.failures,
             "answer": self.answer, "rounds": self.rounds,
+            "rewrite_trace": self.rewrite_trace,
         }
 
 
@@ -257,14 +307,62 @@ class AgentCore:
         run.answer = run.answer or "（达到行动步数上限 | reached act step limit）"
 
     def _run_tool(self, name: str, arg: str) -> Dict[str, Any]:
-        """执行工具；异常结构化返回，绝不让其冒泡杀死循环（DESIGN §13）。"""
+        """执行工具；持久记录入参、结果与 traceback，异常不杀死循环。"""
+        call_id = uuid.uuid4().hex
+        started_at = time.perf_counter()
+        audited_input = _audit_value(arg)
+        _write_tool_audit({
+            "event": "tool_call_started",
+            "call_id": call_id,
+            "tool": name,
+            "input": audited_input,
+        })
         tool = self.tools.get(name)
         if tool is None:
-            return {"error": f"unknown tool | 未知工具: {name}"}
+            error = f"unknown tool | 未知工具: {name}"
+            _write_tool_audit({
+                "event": "tool_call_finished",
+                "call_id": call_id,
+                "tool": name,
+                "status": "error",
+                "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                "error": error,
+            })
+            return {"error": error, "call_id": call_id}
         try:
-            return {"result": tool.func(arg)}
+            result = tool.func(arg)
+            duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+            business_error = result.get("error") if isinstance(result, dict) else None
+            _write_tool_audit({
+                "event": "tool_call_finished",
+                "call_id": call_id,
+                "tool": name,
+                "status": "error" if business_error else "success",
+                "duration_ms": duration_ms,
+                "result": _audit_value(result),
+                **({"error": str(business_error)} if business_error else {}),
+            })
+            if business_error:
+                return {"error": str(business_error), "result": result, "call_id": call_id}
+            return {"result": result}
         except Exception as e:  # noqa: BLE001 —— 有意兜住一切工具异常
-            return {"error": f"{type(e).__name__}: {e}"}
+            error = f"{type(e).__name__}: {e}"
+            trace = traceback.format_exc()
+            duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+            _write_tool_audit({
+                "event": "tool_call_finished",
+                "call_id": call_id,
+                "tool": name,
+                "status": "exception",
+                "duration_ms": duration_ms,
+                "error": error,
+                "traceback": trace,
+            })
+            _TOOL_LOGGER.error(
+                "tool call failed call_id=%s tool=%s input=%r\n%s",
+                call_id, name, audited_input, trace,
+            )
+            return {"error": error, "call_id": call_id}
 
     def _render_history(self, run: AgentRun) -> str:
         lines: List[str] = []
@@ -378,6 +476,13 @@ class AgentCore:
                                          "error": observation["error"]})
                 messages.append({"role": "tool", "tool_call_id": tc.id,
                                  "content": json.dumps(observation, ensure_ascii=False)})
+                result = observation.get("result") if isinstance(observation, dict) else None
+                applied = result.get("applied") if isinstance(result, dict) else None
+                if isinstance(applied, dict):
+                    run.answer = applied.get("message") or "补埋点已完成，改动等待审阅。"
+                    run.transcript.append({"type": "finish", "content": run.answer})
+                    self._maybe_reflect(run)
+                    return run
         run.answer = run.answer or "（达到步数上限 | reached step limit）"
         run.transcript.append({"type": "finish", "content": run.answer})
         self._maybe_reflect(run)
@@ -390,6 +495,10 @@ class AgentCore:
             "你可以调用工具来查找项目、扫描监控盲区、补埋点、记/查笔记等。\n"
             "原则：\n"
             "- 用户表达了**执行意图**（扫描/补埋点/查找等）——哪怕夹着疑问或抱怨——就**直接调用对应工具**，不要只复述用户意图。\n"
+            "- 用户明确要求补/修上次扫描出的盲区时，必须调用 apply_instrumentation；"
+            "只能在工具返回真实失败时解释原因，不能臆测某种语言不支持。\n"
+            "- 发现 unknown 扩展名时，先用 check_language_support 报告事实；用户确认 language 与 extensions 后，"
+            "调用 register_dynamic_language_support，再重扫。不得凭扩展名臆造语言映射。\n"
             "- 纯对话/能直接从背景回答的，就直接回答，不必硬调工具。\n"
             "- 调工具时用绝对路径，不臆造不存在的路径；指代（这个/那个/再扫一遍）结合背景消解。\n\n"
             f"会话背景 CONTEXT：\n{context or '（无）'}"

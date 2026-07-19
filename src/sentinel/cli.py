@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
 from typing import Optional
 
 from sentinel import __version__
@@ -126,9 +128,54 @@ def cmd_apply(args: argparse.Namespace) -> None:
         print(f"  ✅ 已补 {len(res.units_fixed)} 个：{', '.join(res.units_fixed)}")
     if res.skipped:
         print(f"  ⏭ 跳过 {len(res.skipped)} 个（非 Python / 改写不安全）：{', '.join(res.skipped)}")
+    if res.emitter:
+        receiver = "configured" if res.receiver_configured is True else (
+            "not configured" if res.receiver_configured is False else "unverified")
+        print(f"  telemetry: emitter={res.emitter}, receiver={receiver}, delivery={res.delivery}")
+    if res.delivery_note:
+        print(f"  {res.delivery_note}")
     print(f"\n--- diff 预览（未提交，在分支 {res.branch}）---")
     print(res.diff[:2000] or "(无 diff)")
     memory.close()
+
+
+def cmd_telemetry_plan(args: argparse.Namespace) -> None:
+    """生成可审阅的 telemetry plan，不修改代码或外部系统。"""
+    from sentinel.engines.grafana import generate_telemetry_plan
+
+    _register_languages()
+    print(json.dumps(generate_telemetry_plan(args.repo), ensure_ascii=False, indent=2))
+
+
+def cmd_gen_dashboard(args: argparse.Namespace) -> None:
+    """生成 dashboard JSON，可写入文件供人工审阅。"""
+    from sentinel.engines.grafana import generate_dashboard, generate_telemetry_plan
+
+    _register_languages()
+    result = generate_dashboard(generate_telemetry_plan(args.repo), args.datasource_uid)
+    text = json.dumps(result, ensure_ascii=False, indent=2)
+    if args.output:
+        Path(args.output).write_text(text + "\n", encoding="utf-8")
+        print(f"已生成 dashboard JSON：{args.output}")
+    else:
+        print(text)
+
+
+def cmd_deploy_dashboard(args: argparse.Namespace) -> None:
+    """部署已审阅的 dashboard JSON；凭据只从环境读取。"""
+    from sentinel.engines.grafana import deploy_dashboard
+
+    try:
+        payload = json.loads(Path(args.dashboard_json).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        print(f"❌ 无法读取 dashboard JSON：{error}")
+        return
+    dashboard = payload.get("dashboard", payload) if isinstance(payload, dict) else None
+    if not isinstance(dashboard, dict):
+        print("❌ dashboard JSON 顶层必须是对象或包含 dashboard 对象。")
+        return
+    result = deploy_dashboard(dashboard, args.folder_uid)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 
@@ -161,6 +208,21 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("repo", help="仓库路径")
     ap.add_argument("--branch", required=True, help="补埋点落在哪个新分支（须自己命名）")
     ap.set_defaults(func=cmd_apply)
+
+    telemetry = sub.add_parser("telemetry-plan", help="生成可审阅 telemetry plan（不改代码）")
+    telemetry.add_argument("repo", help="仓库路径")
+    telemetry.set_defaults(func=cmd_telemetry_plan)
+
+    dashboard = sub.add_parser("gen-dashboard", help="生成 Grafana dashboard JSON（不部署）")
+    dashboard.add_argument("repo", help="仓库路径")
+    dashboard.add_argument("--datasource-uid", default="", help="Grafana datasource UID")
+    dashboard.add_argument("--output", help="写入 dashboard JSON 文件")
+    dashboard.set_defaults(func=cmd_gen_dashboard)
+
+    deploy = sub.add_parser("deploy-dashboard", help="部署已审阅的 dashboard JSON（需 Grafana 凭据）")
+    deploy.add_argument("dashboard_json", help="gen-dashboard 输出的 JSON 文件")
+    deploy.add_argument("--folder-uid", default="", help="Grafana folder UID")
+    deploy.set_defaults(func=cmd_deploy_dashboard)
 
     return parser
 

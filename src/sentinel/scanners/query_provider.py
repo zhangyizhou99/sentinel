@@ -101,10 +101,19 @@ def compile_ok(language: str, query_str: str) -> Tuple[bool, str]:
     except Exception as e:  # noqa: BLE001  语言名不被支持
         return False, f"未知语言 {language}：{e}"
     try:
-        lang.query(query_str)
+        compile_query(lang, query_str)
         return True, ""
     except Exception as e:  # noqa: BLE001  查询语法/节点名错误
         return False, str(e)
+
+
+def compile_query(language, query_str: str):
+    """编译查询，兼容旧版 ``Language.query`` 与新版 ``Query(language, ...)`` API。"""
+    query_method = getattr(language, "query", None)
+    if callable(query_method):
+        return query_method(query_str)
+    from tree_sitter import Query
+    return Query(language, query_str)
 
 
 def _verify(language: str, queries: Dict[str, str]) -> Tuple[bool, str]:

@@ -63,8 +63,8 @@ def test_scan_tool_permission_gate():
 def test_scan_tool_out_of_scope_denied():
     broker = PermissionBroker(str(_FIXTURES))
     tool = build_scan_tool(broker)
-    # /etc 在范围外 → denied（且不会因不存在而抛错前就拦下）。
-    res = tool.func("/etc")
+    # tests 的父目录存在、且在 fixtures 范围外 → denied。
+    res = tool.func(str(_TESTS.parent))
     assert res.get("denied")
 
 
@@ -108,4 +108,12 @@ def test_find_repo_no_children_key_when_leaf_directory():
     # fixtures 目录若无子目录，则不会作为 key 出现
     if not any(os.path.isdir(os.path.join(str(_FIXTURES), d)) for d in os.listdir(_FIXTURES)):
         assert str(_FIXTURES) not in res["children"]
+
+
+def test_find_repo_empty_result_explains_workspace_scope(tmp_path):
+    tool = build_find_repo_tool(PermissionBroker(str(tmp_path)))
+    res = tool.func("haulhero")
+    assert res["matches"] == []
+    assert "scope_hint" in res
+    assert str(tmp_path) in res["scope_hint"]
 

@@ -5,7 +5,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from sentinel.engines.instrument_editor import insert_instrumentation  # noqa: E402
+from sentinel.engines.instrument_editor import (  # noqa: E402
+    insert_instrumentation,
+    insert_js_import,
+    insert_js_instrumentation,
+)
 
 
 def test_insert_into_plain_function():
@@ -47,3 +51,24 @@ def test_import_not_duplicated():
     assert out is not None
     assert out.count("import logging") == 1           # 已有则不重复
     ast.parse(out)
+
+
+def test_js_insertion_adds_helper_import_once():
+    src = (
+        "// module docs\n"
+        "import { fetchJson } from './client'\n\n"
+        "export async function flush() {\n"
+        "  await fetchJson('/flush')\n"
+        "}\n"
+    )
+    import_stmt = "import { recordObservability } from './observability/events'"
+
+    out = insert_js_instrumentation(
+        src, 4, 6, "recordObservability('queue.flush', 'http')", import_stmt)
+
+    assert out is not None
+    assert out.index(import_stmt) < out.index("import { fetchJson }")
+    assert out.count(import_stmt) == 1
+    assert "  recordObservability('queue.flush', 'http')" in out
+
+    assert insert_js_import(out, import_stmt) == out

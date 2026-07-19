@@ -368,10 +368,11 @@ flowchart LR
 
 - **粒度**：函数级。对准 scan 出的盲区函数（`unit_id`）。
 - **改写方式**：**AST 定位 + 行级插入**（按函数体首行 `lineno` + 缩进插入文本），**不用 `ast.unparse`**（会重排格式、丢注释）；沿用 legacy `editor.py` 的「行级插入 + 从下往上插保行号」手法。
-- **埋点内容**：judge 建议 *what*（该埋什么）× 语义约定 *how*（项目什么风格）；学不到约定退默认 log。
+- **埋点内容**：judge 建议 *what*（该埋什么）× 语义约定 *how*（项目什么风格）。Python 沿用项目 logger 约定；JS/TS/TSX 只有检测到官方 Grafana Faro SDK 与真实 `recordObservability → pushEvent` helper 时才自动补，禁止用 `console.info` 冒充可投递遥测。
 - **安全（复用 legacy 精华）**：git **新分支** + 用户命名 + **未提交**（留工作区给人审）+ **AST 安全网**（改后必须能 parse）+ **幂等**（已埋点跳过）+ 只改有把握的否则跳过 + **破坏性人审门**。
 - **三记忆协同**：语义（*什么风格*）× 程序（*怎么补*）× 情节（*补了啥 + 反馈*）→ 越用越会补。
-- **多语言**：先 Python（`ast`）；TS 补埋点（tree-sitter 改写）后续。
+- **多语言**：扫描与改写分开授权能力。Python 用 `ast`，其它语言通过 tree-sitter grammar/query 动态扩展扫描；改写除语法验证外还要求项目存在可验证的真实 emitter，没有时安全拒绝，不能用 `println`/console 代替。
+- **投递状态**：apply 结果分别给出 `emitter`、`receiver_configured`、`delivery`。源码 emitter 已写入不等于 Grafana 已收到；缺 Faro URL 为 `pending_configuration`，发现 URL 但未做网络验收为 `configured_unverified`。Grafana 看板/告警部署仍属于 roadmap 第 7 步的后续能力。
 
 ---
 

@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -26,6 +27,7 @@ from sentinel.cognition.context_builder import (
 
 # 低于此置信度 → 标「存疑」，不自动进修复清单（§7.3，与用户确认阈值 0.5）。
 _UNCERTAIN_BELOW = 0.5
+_LOGGER = logging.getLogger(__name__)
 
 
 # -- Prompt（中英双语双版本 · 已与用户共审 · DESIGN §15）------------------------
@@ -103,25 +105,38 @@ def judge_intent(unit: CodeUnit, index, llm, *, repo: str = "",
 
     # 无 LLM：降级为「基于静态信号的通用建议」（air-gapped 仍可用 · §13.5）。
     if not getattr(llm, "available", False):
-        knowledge = knowledge_for(signals)
-        sugg = [{"type": "metric", "what": o} for obs in knowledge.values() for o in obs][:6]
-        return Verdict(
-            unit_id=unit.unit_id,
-            verdict="instrument" if signals else "skip",
-            confidence=0.0,
-            suggestions=sugg,
-            evidence=[f"knowledge:{s}" for s in signals],
-            reason="LLM 不可用：基于静态信号给出的通用建议 | no LLM, generic advice from signals",
-            status="llm_unavailable",
-            context=ctx.to_trace(),
-        )
+        return _generic_verdict(unit, signals, ctx.to_trace(), "LLM 不可用 | LLM unavailable")
 
     user = ("Decide based ONLY on the CONTEXT below. | 只依据下面的上下文判定。\n\n"
             "CONTEXT | 上下文:\n" + ctx.text)
-    raw = llm.complete(_JUDGE_SYSTEM, user)
+    try:
+        raw = llm.complete(_JUDGE_SYSTEM, user)
+    except Exception:  # noqa: BLE001 - 外部 LLM 失败不能中断基础扫描报告。
+        _LOGGER.exception("judge LLM call failed for %s", unit.unit_id)
+        return _generic_verdict(unit, signals, ctx.to_trace(), "LLM 调用失败 | LLM call failed")
     verdict = _parse(raw, unit)
     verdict.context = ctx.to_trace()
     return verdict
+
+
+def _generic_verdict(unit: CodeUnit, signals: List[str], context: List[Dict], reason: str) -> Verdict:
+    """LLM 不可用时，用确定性知识库生成可展示的保底判定。"""
+    knowledge = knowledge_for(signals)
+    suggestions = [
+        {"type": "metric", "what": observation}
+        for observations in knowledge.values()
+        for observation in observations
+    ][:6]
+    return Verdict(
+        unit_id=unit.unit_id,
+        verdict="instrument" if signals else "skip",
+        confidence=0.0,
+        suggestions=suggestions,
+        evidence=[f"knowledge:{signal}" for signal in signals],
+        reason=f"{reason}：基于静态信号给出的通用建议 | generic advice from signals",
+        status="llm_unavailable",
+        context=context,
+    )
 
 
 def _parse(raw: str, unit: CodeUnit) -> Verdict:

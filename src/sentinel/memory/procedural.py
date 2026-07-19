@@ -61,7 +61,7 @@ class ProceduralMemory:
         self._conn.commit()
 
     def record_skill(self, language: str, signal: str, snippet_template: str,
-                     import_stmt: str = "", framework: str = "") -> None:
+                     import_stmt: Optional[str] = "", framework: str = "") -> None:
         """记住一条修复技能；已存在则更新模板并把 uses +1（成功越多越可信）。"""
         self._conn.execute(
             """
@@ -73,7 +73,7 @@ class ProceduralMemory:
                 uses = uses + 1,
                 ts = excluded.ts
             """,
-            (language, framework, signal, snippet_template, import_stmt, _now()),
+            (language, framework or "", signal, snippet_template, import_stmt or "", _now()),
         )
         self._conn.commit()
 

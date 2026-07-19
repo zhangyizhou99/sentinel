@@ -17,7 +17,7 @@ pip install -r requirements.txt
 
 # 2) 配置模型（密钥只填 .env，绝不填 .env.example）
 cp .env.example .env
-# 编辑 .env：SENTINEL_PROVIDER=openai/deepseek/moonshot，并填 SENTINEL_API_KEY
+# 编辑 .env：SENTINEL_PROVIDER=openai/deepseek/moonshot/github/copilot，并填 SENTINEL_API_KEY
 
 # 3) 验证链路（没配 key 时自动离线回显）
 PYTHONPATH=src python3 -m sentinel ping "你好"
@@ -25,6 +25,65 @@ PYTHONPATH=src python3 -m sentinel ping "你好"
 # 4) 跑测试
 PYTHONPATH=src python3 -m pytest tests/ -q
 ```
+
+### 使用本地 GitHub Copilot 代理
+
+项目已经内置 `copilot` provider，可对接已克隆的 [copilot-api](../copilot-api)。先在另一个终端安装依赖、启动代理并完成 GitHub 设备登录：
+
+```powershell
+Set-Location ..\copilot-api
+bun install
+bun run start --port 4141 --rate-limit 5 --wait
+```
+
+源码方式需要 Bun（>= 1.2）。本机只有 Node.js 时，也可以使用 README 提供的已发布包：
+
+```powershell
+npx --yes copilot-api@latest start --port 4141 --rate-limit 5 --wait
+```
+
+首次启动会显示 GitHub 设备授权码；完成授权后，代理会把认证状态保存到用户目录，后续启动无需重复登录。然后在 Sentinel 的 `.env` 中配置：
+
+```dotenv
+SENTINEL_PROVIDER=copilot
+SENTINEL_API_KEY=placeholder
+SENTINEL_MODEL=gpt-4o
+# 可选；默认已经是 http://localhost:4141/v1
+SENTINEL_BASE_URL=http://127.0.0.1:4141/v1
+```
+
+`SENTINEL_API_KEY` 只用于满足 OpenAI 客户端的认证参数，代理当前不校验其值。启动 Sentinel 前可用 `Invoke-RestMethod http://127.0.0.1:4141/v1/models` 查看代理实际开放的模型，并将 `SENTINEL_MODEL` 改为列表中的模型 ID。
+
+### 本地协作原型
+
+本地版本已具备稳定的用户、工作区、任务和 checkpoint 数据模型；数据仍写入本机 `~/.cache/sentinel/episodic.db`，因此**不会跨电脑同步**。在 `.env` 里设置相同的 `SENTINEL_USER_ID` 表示同一用户；设置相同的 `SENTINEL_WORKSPACE_ID` 表示共享同一个团队工作区。
+
+```dotenv
+SENTINEL_USER_ID=alice
+SENTINEL_USER_NAME=Alice
+SENTINEL_WORKSPACE_ID=team-alpha
+SENTINEL_WORKSPACE_NAME=Team Alpha
+```
+
+记忆权限有四档：`private` 仅作者可读；`team` 对工作区成员可读；`repo` 只在对应仓库上下文召回；`task` 只在对应任务上下文召回。任务 checkpoint 保存负责人、已完成项、下一步和分支/产物。当前 Web 页面会显示本地身份与工作区；云端同步和 OAuth 登录将基于同一数据模型后续接入。
+
+项目搜索只会在 `SENTINEL_WORKSPACE_ROOT` 之内进行。若找不到同级项目，Agent 会提示范围可能过小并询问是否扩大边界；确认后修改 `.env` 并重启 Sentinel，例如：
+
+```dotenv
+SENTINEL_WORKSPACE_ROOT=d:\Code
+```
+
+### 补埋点与 Grafana 投递状态
+
+`apply_instrumentation` 会把三个状态分开报告，不能互相替代：
+
+- `emitter`：源码里已经接入的结构化遥测出口，例如 `grafana-faro`。
+- `receiver_configured`：Sentinel 是否在项目配置中检测到 Faro Receiver collect URL。
+- `delivery`：`pending_configuration` 表示缺 Receiver；`configured_unverified` 表示已有配置但尚未做真实网络投递验证。
+
+JS/TS/TSX 只有在同一 package 已声明官方 `@grafana/faro-web-sdk`，并存在实际调用 `pushEvent` 的 `recordObservability` helper 时才会自动改写。普通 `console.info` 不算遥测，也不会被用作降级方案。其它语言可以通过 tree-sitter 动态补齐扫描能力；自动改写还必须另外发现可验证的项目 emitter，否则会在创建 git 分支前安全拒绝。
+
+工具调用会以 JSONL 写入 `~/.cache/sentinel/tool-calls.jsonl`。每次调用包含 `call_id`、脱敏后的入参、耗时与结果；异常会额外记录完整 traceback。可用 `SENTINEL_TOOL_CALL_LOG` 覆盖日志路径，UI 错误摘要中的 `call_id` 可用于定位对应记录。
 
 ---
 

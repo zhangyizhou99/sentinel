@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 from typing import Any, Dict, Optional
 
 from sentinel.engines.agent import Tool
@@ -37,6 +38,8 @@ _FIND_DESC = (
     "the matching subdirectory from `children` and pass 'match/subdir' to scan — only choose from "
     "the real entries listed, never invent a path. If there's no matching child, use the match "
     "directory as-is. Lists directory names only; no file contents, no permission needed."
+        "If matches is empty, inspect scope_hint and tell the user the project may be outside the "
+        "allowed workspace; ask whether they want to expand SENTINEL_WORKSPACE_ROOT and restart."
 )
 
 _SCAN_DESC = (
@@ -134,7 +137,14 @@ def build_find_repo_tool(broker: PermissionBroker) -> Tool:
         # children：每个匹配目录下真实存在的一级子目录（结构性事实，确定性列出）。
         # LLM 据此做语义判断（如「前端」该选哪个），只能从这些真实项里选，不能凭空造路径。
         children = {p: c for p in kept if (c := _immediate_children(p))}
-        return {"query": query, "root": root, "matches": kept, "children": children}
+        result = {"query": query, "root": root, "matches": kept, "children": children}
+        if not kept:
+            result["scope_hint"] = (
+                f"未在允许范围 {root} 内找到 {query!r}。项目可能位于范围外；"
+                "请询问用户是否要将 SENTINEL_WORKSPACE_ROOT 调整为包含该项目的父目录，"
+                "并在重启 Sentinel 后重新搜索。"
+            )
+        return result
 
     return Tool("find_repo", _FIND_DESC, _find)
 
@@ -224,15 +234,30 @@ _APPLY_DESC = (
     "参数：targets=补哪些（留空=全部；或逗号分隔的函数名/关键词，如 'checkin' 或 'checkin,load_cargo'）——"
     "用户说「只补第一个 / 前两个 / 除了 X 都补」时，你要先看扫描结果把它对应到具体函数名再填；"
     "branch=分支名（用户指定就用，没说留空=用建议名）；repo=仓库路径（一般是最近扫的，可留空）。\n"
-    "仅当用户明确要补埋点/修复盲区时调用。目前只支持 Python，前端 TS/JS 暂不支持。 | "
+    "仅当用户明确要补埋点/修复盲区时调用。Python 会遵循项目日志约定；JS/TS/TSX 仅在项目"
+    "已有官方 Grafana Faro SDK + recordObservability/pushEvent helper 时自动改写，绝不以"
+    "console.info 冒充遥测。结果会分别报告 emitter、receiver_configured 与 delivery；"
+    "源码已改不等于 Grafana 已收到。其它语言可扫描，但没有可验证 emitter 时会安全拒绝改写。 | "
     "apply_instrumentation: instrument blind-spot functions; edits land on a new uncommitted git branch."
 )
 
 
+def _available_branch(repo: str, base: str) -> str:
+    """返回一个尚不存在的分支名，避免失败遗留分支阻塞重试。"""
+    candidate = base
+    suffix = 2
+    while os.path.exists(os.path.join(repo, ".git")) and subprocess.run(
+            ["git", "-C", repo, "rev-parse", "--verify", candidate],
+            capture_output=True, text=True, check=False).returncode == 0:
+        candidate = f"{base}-{suffix}"
+        suffix += 1
+    return candidate
+
+
 def _suggest_branch(repo: str) -> str:
-    """给一个建议分支名：sentinel/instrument-<仓库名>。"""
+    """给一个未占用的建议分支名：sentinel/instrument-<仓库名>。"""
     name = os.path.basename(os.path.abspath(repo).rstrip(os.sep)) or "repo"
-    return f"sentinel/instrument-{name}"
+    return _available_branch(repo, f"sentinel/instrument-{name}")
 
 
 def _select_targets(spots, targets: str):
@@ -247,11 +272,16 @@ def _select_targets(spots, targets: str):
         n = int(t)
         return list(spots[n - 1:n]) if 1 <= n <= len(spots) else []
     keys = [k.strip().lower() for k in re.split(r"[,，、\s]+", t) if k.strip()]
-    return [u for u in spots if any(k in u.unit_id.lower() for k in keys)]
+    selected = [u for u in spots if any(k in u.unit_id.lower() for k in keys)]
+    if selected:
+        return selected
+    # 用户常说「补 queue.ts 里的几个」，文件名不是函数名时应展开为该文件全部盲区。
+    normalized = t.replace("\\", "/").lower()
+    return [u for u in spots if u.file.replace("\\", "/").lower().endswith(normalized)]
 
 
 def build_apply_tool(broker: Optional[PermissionBroker] = None, memory=None,
-                     notes=None, procedural=None) -> Tool:
+                     notes=None, procedural=None, llm=None) -> Tool:
     """构造 apply_instrumentation 工具（**结构化执行器**）。
 
     LLM 从用户的话 + 扫描结果里填 branch/targets（意图理解归 LLM）；工具按 targets 确定性过滤
@@ -279,18 +309,25 @@ def build_apply_tool(broker: Optional[PermissionBroker] = None, memory=None,
         if not selected:
             return {"error": f"没找到匹配「{targets}」的盲区；可选："
                              + ", ".join(u.unit_id for u in spots[:10])}
-        branch = (args.get("branch") or "").strip() or _suggest_branch(repo)
+        requested_branch = (args.get("branch") or "").strip()
+        branch = (_available_branch(repo, requested_branch) if requested_branch
+              else _suggest_branch(repo))
         from sentinel.engines.apply import Applier, ApplyError
         from sentinel.engines.conventions import learn_convention
         conv = learn_convention(repo, result.units)
         try:
-            res = Applier().apply(repo, selected, branch, convention=conv, procedural=procedural)
+            res = Applier(llm=llm).apply(repo, selected, branch, convention=conv, procedural=procedural)
         except ApplyError as e:
             return {"error": str(e)}
         return {"applied": {
             "branch": res.branch, "base_branch": res.base_branch,
             "units_fixed": res.units_fixed, "skipped": res.skipped,
+            "skipped_reasons": res.skipped_reasons,
             "files_changed": res.files_changed, "diff": res.diff[:3000],
+            "emitter": res.emitter,
+            "receiver_configured": res.receiver_configured,
+            "delivery": res.delivery,
+            "delivery_note": res.delivery_note,
             "message": res.message,
         }}
 
@@ -306,6 +343,83 @@ def build_apply_tool(broker: Optional[PermissionBroker] = None, memory=None,
         },
     }
     return Tool("apply_instrumentation", _APPLY_DESC, _apply, parameters=params, structured=True)
+
+
+_TELEMETRY_PLAN_DESC = (
+    "instrument(repo) — 根据当前扫描到的盲区生成可审阅的事件命名、信号和语言计划；"
+    "不改源码、不部署。要补代码用 apply_instrumentation；要生成看板用 gen_dashboard。"
+)
+
+
+def build_telemetry_plan_tool(broker: Optional[PermissionBroker] = None) -> Tool:
+    from sentinel.engines.grafana import generate_telemetry_plan
+
+    def _plan(repo: str) -> Dict[str, Any]:
+        path = _clean(repo)
+        if broker is not None and not broker.within_scope(path):
+            return {"denied": os.path.abspath(path), "reason": "超出允许的工作区范围"}
+        if not os.path.exists(path):
+            return {"error": f"路径不存在: {path}"}
+        return generate_telemetry_plan(path)
+
+    return Tool("instrument", _TELEMETRY_PLAN_DESC, _plan)
+
+
+_DASHBOARD_DESC = (
+    "gen_dashboard(repo, datasource_uid) — 从仓库当前的 telemetry plan 生成 Grafana dashboard JSON，"
+    "不部署。datasource_uid 可留空，届时结果会明确标记为未绑定数据源。"
+)
+
+
+def build_dashboard_tool(broker: Optional[PermissionBroker] = None) -> Tool:
+    from sentinel.engines.grafana import generate_dashboard, generate_telemetry_plan
+
+    def _dashboard(args) -> Dict[str, Any]:
+        if not isinstance(args, dict):
+            args = {"repo": str(args)}
+        repo = _clean(args.get("repo", ""))
+        if broker is not None and not broker.within_scope(repo):
+            return {"denied": os.path.abspath(repo), "reason": "超出允许的工作区范围"}
+        if not os.path.exists(repo):
+            return {"error": f"路径不存在: {repo}"}
+        plan = generate_telemetry_plan(repo)
+        return {"plan": plan, **generate_dashboard(plan, _clean(args.get("datasource_uid", "")))}
+
+    return Tool("gen_dashboard", _DASHBOARD_DESC, _dashboard, parameters={
+        "type": "object",
+        "properties": {
+            "repo": {"type": "string", "description": "仓库绝对路径"},
+            "datasource_uid": {"type": "string", "description": "Grafana datasource UID，可留空"},
+        },
+        "required": ["repo"],
+    }, structured=True)
+
+
+_DEPLOY_DASHBOARD_DESC = (
+    "deploy_dashboard(dashboard, folder_uid) — 【破坏性】通过 Grafana HTTP Provisioning API 幂等 upsert "
+    "已审阅的 dashboard JSON。仅当用户明确要求部署且已配置 GRAFANA_URL/GRAFANA_TOKEN 时调用。"
+)
+
+
+def build_deploy_dashboard_tool() -> Tool:
+    from sentinel.engines.grafana import deploy_dashboard
+
+    def _deploy(args) -> Dict[str, Any]:
+        if not isinstance(args, dict) or not isinstance(args.get("dashboard"), dict):
+            return {"ok": False, "reason": "需要经过审阅的 dashboard JSON 对象"}
+        if args.get("approved") is not True:
+            return {"ok": False, "reason": "dashboard 部署需要用户明确审批（approved=true）；未发起部署。"}
+        return deploy_dashboard(args["dashboard"], _clean(args.get("folder_uid", "")))
+
+    return Tool("deploy_dashboard", _DEPLOY_DASHBOARD_DESC, _deploy, parameters={
+        "type": "object",
+        "properties": {
+            "dashboard": {"type": "object", "description": "gen_dashboard 返回的 dashboard JSON"},
+            "folder_uid": {"type": "string", "description": "Grafana folder UID，可留空"},
+            "approved": {"type": "boolean", "description": "只有用户已明确同意部署时才可为 true"},
+        },
+        "required": ["dashboard", "approved"],
+    }, structured=True)
 
 
 # ---- check_language_support：报告语言覆盖面与缺口（只读，免授权）--------------
@@ -374,6 +488,39 @@ def build_install_language_tool(llm=None) -> Tool:
         return install_language_support(lang, llm=llm)
 
     return Tool("install_language_support", _INSTALL_LANG_DESC, _install)
+
+
+_REGISTER_LANG_DESC = (
+    "register_dynamic_language_support(language, extensions) — 为当前未知扩展名注册新的 "
+    "tree-sitter 语言支持。仅当用户明确要求补齐，并确认语言名与扩展名对应关系后调用。"
+    "工具会让 LLM 生成函数/调用查询，但必须在真实 grammar 上编译通过才保存映射；失败不修改配置。"
+)
+
+
+def build_register_dynamic_language_tool(llm=None) -> Tool:
+    """构造未知语言注册工具：扩展名映射仅在验证成功后才持久化。"""
+    from sentinel.scanners.treesitter_scanner import register_dynamic_language_support
+
+    def _register(args) -> Dict[str, Any]:
+        if not isinstance(args, dict):
+            return {"ok": False, "reason": "需要 language 与 extensions 参数"}
+        language = _clean(args.get("language", "")).lower()
+        extensions = args.get("extensions") or []
+        if isinstance(extensions, str):
+            extensions = [part.strip() for part in extensions.split(",")]
+        if not isinstance(extensions, list):
+            return {"ok": False, "reason": "extensions 必须是扩展名列表"}
+        return register_dynamic_language_support(language, [str(ext) for ext in extensions], llm=llm)
+
+    return Tool("register_dynamic_language_support", _REGISTER_LANG_DESC, _register, parameters={
+        "type": "object",
+        "properties": {
+            "language": {"type": "string", "description": "tree-sitter-language-pack 语言名，例如 vue、swift"},
+            "extensions": {"type": "array", "items": {"type": "string"},
+                           "description": "用户确认属于该语言的扩展名，例如 ['.vue']"},
+        },
+        "required": ["language", "extensions"],
+    }, structured=True)
 
 
 # ---- ignore_finding：把某盲区标为「不用埋点」，形成反馈学习（Agentic-RL）--------

@@ -2,8 +2,8 @@
 
 放在独立小模块（不 import 任何 scanner / engine），避免 scan.py 与各语言
 解析器之间的循环导入。判据基于子串：遵循三层召回漏斗的 L1（确定性）。
-注意：**不把 `console.log` 当埋点**（它是调试而非结构化遥测，且前端满地都是，
-当埋点会把几乎所有函数判成“已埋点”而掩盖真盲区）；只认 console.error/warn 等错误级。
+注意：**不把 `console.log` / `console.info` 当埋点**（它们是本地控制台输出，不代表
+遥测已进入后端）；否则会掩盖真正的投递盲区。console.error/warn 仍作为错误日志识别。
 """
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from typing import Dict, Tuple
 
 # 跨语言共享的遥测词（logger/otel/prometheus 等在多数生态里同名）。
 _COMMON: Tuple[str, ...] = (
+    "recordobservability", "pushevent", "@grafana/faro", "initializefaro",
     "logger", "logging", "getlogger", ".log(", "log.info", "log.error",
     "metrics", "meter", "counter", "histogram", "gauge",
     "tracer", "span", "otel", "opentelemetry", "statsd", "prometheus",

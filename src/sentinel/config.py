@@ -46,6 +46,24 @@ PROVIDERS: Dict[str, Dict[str, str]] = {
 }
 
 
+def _load_dotenv() -> None:
+    """按调用方工作目录加载 .env；系统环境变量仍保持更高优先级。"""
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+
+
+def _dotenv_values() -> Dict[str, str]:
+    """读取 .env 原始值，用于识别已被注入 os.environ 的文件配置。"""
+    try:
+        from dotenv import dotenv_values
+        return {key: value for key, value in dotenv_values().items() if value is not None}
+    except ImportError:
+        return {}
+
+
 @dataclass
 class LLMConfig:
     """一份与具体厂商无关的模型配置。"""
@@ -61,26 +79,66 @@ class LLMConfig:
 
         key 的取值优先级：SENTINEL_API_KEY（统一）> provider 官方环境变量。
         """
+        # 显式环境提供方（如 CI）不能继承 .env 中另一个 provider 的 URL/模型。
+        env_provider = os.getenv("SENTINEL_PROVIDER")
+        env_api_key = os.getenv("SENTINEL_API_KEY")
+        env_base_url = os.getenv("SENTINEL_BASE_URL")
+        env_model = os.getenv("SENTINEL_MODEL")
+        file_values = _dotenv_values()
+        overrides_file_provider = bool(
+            env_provider and env_provider != file_values.get("SENTINEL_PROVIDER")
+        )
         # 先加载 .env，让密钥留在文件里而不是 shell 历史里。
-        try:
-            from dotenv import load_dotenv
-            load_dotenv()
-        except ImportError:
-            pass  # 没装 dotenv 就直接读系统环境变量
+        _load_dotenv()
 
-        provider = os.getenv("SENTINEL_PROVIDER", "openai").lower()
+        provider = (env_provider or os.getenv("SENTINEL_PROVIDER", "openai")).lower()
         preset = PROVIDERS.get(provider, {})
 
-        api_key = os.getenv("SENTINEL_API_KEY")
+        api_key = env_api_key
+        if overrides_file_provider and api_key == file_values.get("SENTINEL_API_KEY"):
+            api_key = None
+        if not api_key and not env_provider:
+            api_key = os.getenv("SENTINEL_API_KEY")
         if not api_key and preset:
             api_key = os.getenv(preset["api_key_env"])
+
+        base_url = env_base_url
+        model = env_model
+        if overrides_file_provider:
+            if base_url == file_values.get("SENTINEL_BASE_URL"):
+                base_url = None
+            if model == file_values.get("SENTINEL_MODEL"):
+                model = None
+        if not env_provider:
+            base_url = base_url or os.getenv("SENTINEL_BASE_URL")
+            model = model or os.getenv("SENTINEL_MODEL")
 
         return cls(
             provider=provider,
             api_key=api_key,
-            base_url=os.getenv("SENTINEL_BASE_URL") or preset.get("base_url"),
-            model=os.getenv("SENTINEL_MODEL") or preset.get("default_model"),
+            base_url=base_url or preset.get("base_url"),
+            model=model or preset.get("default_model"),
             temperature=float(os.getenv("SENTINEL_TEMPERATURE", "0.2")),
+        )
+
+
+@dataclass(frozen=True)
+class LocalIdentity:
+    """本地协作原型的稳定身份与工作区边界。"""
+
+    user_id: str
+    display_name: str
+    workspace_id: str
+    workspace_name: str
+
+    @classmethod
+    def from_env(cls) -> "LocalIdentity":
+        _load_dotenv()
+        return cls(
+            user_id=os.getenv("SENTINEL_USER_ID", "local-user").strip(),
+            display_name=os.getenv("SENTINEL_USER_NAME", "本地用户").strip(),
+            workspace_id=os.getenv("SENTINEL_WORKSPACE_ID", "local-workspace").strip(),
+            workspace_name=os.getenv("SENTINEL_WORKSPACE_NAME", "本地工作区").strip(),
         )
 
 
@@ -90,6 +148,7 @@ def workspace_root() -> str:
     默认 = 启动 Sentinel 的当前目录（直觉：它只看你把它放进去的那个工作区）；
     可用 SENTINEL_WORKSPACE_ROOT 覆盖。所有文件访问都不得越出这个根。
     """
+    _load_dotenv()
     return os.path.abspath(os.path.expanduser(
         os.getenv("SENTINEL_WORKSPACE_ROOT") or os.getcwd()
     ))
@@ -111,5 +170,11 @@ def cache_dir() -> str:
 def episodic_db_path() -> str:
     """情节记忆（SQLite）文件路径：记录每次运行与用户反馈（DESIGN §11 Agentic-RL）。"""
     return os.path.join(cache_dir(), "episodic.db")
+def tool_call_log_path() -> str:
+    """工具调用审计日志路径；JSONL，便于按 call_id 追踪原始异常。"""
+    return os.path.abspath(os.path.expanduser(
+        os.getenv("SENTINEL_TOOL_CALL_LOG")
+        or os.path.join(cache_dir(), "tool-calls.jsonl")
+    ))
 
 

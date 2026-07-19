@@ -16,7 +16,7 @@ from sentinel.model.code_unit import CodeUnit
 from sentinel.scanners.base import LanguageScanner, register
 from sentinel.scanners.instrumentation import has_instrumentation
 from sentinel.scanners.catalog import extensions_for_language
-from sentinel.scanners.query_provider import get_queries
+from sentinel.scanners.query_provider import compile_query, get_queries
 
 
 def _text(node, src: bytes) -> str:
@@ -29,6 +29,24 @@ def _signature(fn_node, src: bytes) -> str:
         if child.type.endswith("parameters") or child.type == "formal_parameters":
             return _text(child, src)
     return "()"
+
+
+def _matches(query, node):
+    """执行函数查询，兼容旧版 Query.matches 与新版 QueryCursor.matches。"""
+    method = getattr(query, "matches", None)
+    if callable(method):
+        return method(node)
+    from tree_sitter import QueryCursor
+    return QueryCursor(query).matches(node)
+
+
+def _captures(query, node):
+    """执行调用点查询，兼容旧版 Query.captures 与新版 QueryCursor.captures。"""
+    method = getattr(query, "captures", None)
+    if callable(method):
+        return method(node)
+    from tree_sitter import QueryCursor
+    return QueryCursor(query).captures(node)
 
 
 class TreeSitterScanner(LanguageScanner):
@@ -49,8 +67,8 @@ class TreeSitterScanner(LanguageScanner):
             from tree_sitter_language_pack import get_parser, get_language
             self._parser = get_parser(self.language)  # type: ignore[arg-type]
             lang = get_language(self.language)         # type: ignore[arg-type]
-            self._fn_query = lang.query(self._queries["functions"])
-            self._call_query = lang.query(self._queries["calls"])
+            self._fn_query = compile_query(lang, self._queries["functions"])
+            self._call_query = compile_query(lang, self._queries["calls"])
             return True
         except Exception:  # noqa: BLE001  解析器/查询不可用 → 容错跳过
             self._parser = None
@@ -70,7 +88,7 @@ class TreeSitterScanner(LanguageScanner):
             return []
 
         units: List[CodeUnit] = []
-        for _pattern_idx, caps in self._fn_query.matches(tree.root_node):
+        for _pattern_idx, caps in _matches(self._fn_query, tree.root_node):
             fn_nodes = caps.get("fn") or []
             name_nodes = caps.get("name") or []
             if not fn_nodes:
@@ -96,25 +114,25 @@ class TreeSitterScanner(LanguageScanner):
         return units
 
     def _calls_in(self, fn_node, src: bytes) -> List[str]:
-        caps = self._call_query.captures(fn_node)
+        caps = _captures(self._call_query, fn_node)
         callees = caps.get("callee", []) if isinstance(caps, dict) else []
         return [_text(n, src) for n in callees]
 
 
-def build_scanner(language: str, llm=None) -> Optional[TreeSitterScanner]:
+def build_scanner(language: str, llm=None, extensions: Optional[List[str]] = None) -> Optional[TreeSitterScanner]:
     """为某语言构造解析器：拿查询（内置/缓存/LLM）→ 建实例。拿不到查询返回 None。"""
     queries = get_queries(language, llm=llm)
     if not queries:
         return None
-    exts = extensions_for_language(language)
+    exts = extensions or extensions_for_language(language)
     if not exts:
         return None
     return TreeSitterScanner(language, exts, queries)
 
 
-def register_language(language: str, llm=None) -> Optional[TreeSitterScanner]:
+def register_language(language: str, llm=None, extensions: Optional[List[str]] = None) -> Optional[TreeSitterScanner]:
     """构造并注册某语言解析器（注册后 get_scanner_for 即可命中）。成功返回实例。"""
-    scanner = build_scanner(language, llm=llm)
+    scanner = build_scanner(language, llm=llm, extensions=extensions)
     if scanner is None:
         return None
     register(scanner)
@@ -164,7 +182,7 @@ def install_language_support(language: str, llm=None) -> Dict[str, object]:
         import sys
         try:
             subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "--user", "--quiet",
+                [sys.executable, "-m", "pip", "install", "--quiet",
                  "tree-sitter-language-pack"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
@@ -181,3 +199,37 @@ def install_language_support(language: str, llm=None) -> Dict[str, object]:
                 "reason": "没能获得该语言的 tree-sitter 查询（无内置/缓存，LLM 也未产出可编译查询）"
                           " | could not obtain a compilable query for this language"}
     return {"ok": True, "language": language, "extensions": list(scanner.EXTENSIONS)}
+
+
+def register_dynamic_language_support(language: str, extensions: List[str], llm=None) -> Dict[str, object]:
+    """为用户确认的陌生扩展名注册可验证的 tree-sitter 扫描能力。"""
+    normalized = [ext.lower() if ext.startswith(".") else f".{ext.lower()}" for ext in extensions]
+    if not normalized:
+        return {"ok": False, "language": language, "reason": "至少需要一个扩展名"}
+    if not language_pack_available():
+        installed = install_language_support(language, llm=llm)
+        if not installed.get("ok"):
+            return installed
+    scanner = register_language(language.lower(), llm=llm, extensions=normalized)
+    if scanner is None:
+        return {"ok": False, "language": language, "reason": "语言 grammar 或查询无法通过编译验证"}
+    from sentinel.scanners.catalog import register_language_extensions
+    register_language_extensions(language, normalized)
+    return {"ok": True, "language": language.lower(), "extensions": normalized,
+            "note": "已持久化扩展名映射；重启后仍可重建该解析器。"}
+
+
+def source_parses(language: str, source: str) -> bool:
+    """用已安装 grammar 检查候选补丁的语法；不能验证时一律拒绝应用。"""
+    try:
+        from tree_sitter_language_pack import get_parser
+        tree = get_parser(language).parse(source.encode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return False
+
+    def valid(node) -> bool:
+        if node.type == "ERROR" or node.is_missing:
+            return False
+        return all(valid(child) for child in node.children)
+
+    return valid(tree.root_node)

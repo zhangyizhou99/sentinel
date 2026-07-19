@@ -185,6 +185,15 @@ def test_turn_builder_conversation_and_last_scan():
     assert "[CONVERSATION]" in ctx.text and "这个不用加了" in ctx.text     # 近期对话在
 
 
+def test_turn_builder_includes_language_gap_and_safe_next_action():
+    last = {"repo": "/tmp/web", "spots": [], "language_gap": {"typescript": 6, "tsx": 8}}
+    ctx = default_turn_builder(notes=None).build(
+        ContextTarget(repo="/tmp/web", turns=[("user", "补齐后再扫")], last_scan=last))
+    assert "typescript(6 文件)" in ctx.text
+    assert "install_language_support" in ctx.text
+    assert "明确同意" in ctx.text
+
+
 def test_unit_providers_safe_without_unit():
     # 对话级目标没有 unit：Target/Peer 应安全返回空，不报错
     t = ContextTarget(repo="/tmp/r", turns=[("user", "hi")])
