@@ -59,6 +59,7 @@ from sentinel.engines.judge import judge_intent
 from sentinel.cognition import CodeIndex
 from sentinel.llm import LLMClient
 from sentinel.permissions import PermissionBroker
+import logging
 
 # 全局单例：LLM 客户端（无 key 时 available=False，走降级路径，不崩）。
 _LLM = LLMClient()
@@ -95,6 +96,20 @@ def _get_procedural():
         from sentinel.memory import ProceduralMemory
         _PROCEDURAL = ProceduralMemory()
     return _PROCEDURAL
+
+
+# 外部 MCP 工具只在首次构造 Agent 时发现一次；配置变更后重启进程即可刷新。
+# 连接失败会缓存为空，避免每轮对话都等待远程超时，Sentinel 本地能力照常可用。
+_MCP_TOOLS = None
+
+
+def _get_mcp_tools():
+    global _MCP_TOOLS
+    if _MCP_TOOLS is None:
+        from sentinel.integrations import MCPClientManager, configured_mcp_servers
+        servers = configured_mcp_servers()
+        _MCP_TOOLS = MCPClientManager(servers).discover() if servers else {}
+    return dict(_MCP_TOOLS)
 
 
 # 本地协作原型：身份/工作区写入本地 SQLite；后续可替换为云端实现。
@@ -154,6 +169,7 @@ def _build_agent(broker: PermissionBroker) -> AgentCore:
     dashboard = build_dashboard_tool(broker)
     deploy_dashboard = build_deploy_dashboard_tool()
     tools = {t.name: t for t in (find, scan, check, install, register_language, ignore, add_note, recall, apply, telemetry_plan, dashboard, deploy_dashboard)}
+    tools.update(_get_mcp_tools())
     return AgentCore(_LLM, tools=tools)
 
 
@@ -587,6 +603,7 @@ def _run_and_format(broker: PermissionBroker, goal: str, state: dict) -> str:
     """跑一次 agent；若撞到权限门则转成授权请求，否则渲染结果。"""
     state["goal"] = goal
     run = _build_agent(broker).run(goal=goal)
+    _stash_focus_from_run(state, run)
     pending = _collect(run, "permission_required")
     if pending:
         state["pending"] = pending
@@ -606,6 +623,7 @@ def respond(message: str, history, state) -> str:
         state["broker"] = PermissionBroker(workspace_root())
         state["pending"] = []
         state["goal"] = None
+        state["focus_repo"] = ""
     broker: PermissionBroker = state["broker"]
 
     if not msg:
@@ -655,11 +673,13 @@ def _ensure(state) -> dict:
         state["pending"] = []
         state["candidates"] = []
         state["goal"] = None
+        state["focus_repo"] = ""
     if "identity" not in state:
         identity = LocalIdentity.from_env()
         _get_collaboration(identity)
         state["identity"] = identity
     state.setdefault("pending_apply", None)
+    state.setdefault("focus_repo", "")
     return state
 
 
@@ -695,6 +715,7 @@ def _stash_scan(state: dict, report) -> None:
             for b in report.get("blind_spots", [])
         ],
     }
+    state["focus_repo"] = report.get("repo", "")
 
 
 def _stash_scan_from_run(state: dict, run: AgentRun) -> None:
@@ -705,6 +726,37 @@ def _stash_scan_from_run(state: dict, run: AgentRun) -> None:
             return
 
 
+def _stash_focus_from_run(state: dict, run: AgentRun) -> None:
+    """把本轮最近确认的本地仓库写成对话焦点，不冒充扫描快照。"""
+    for item in reversed(run.transcript):
+        if item.get("type") != "action":
+            continue
+        result = (item.get("observation") or {}).get("result")
+        if not isinstance(result, dict):
+            continue
+        local_repo = result.get("local_repo")
+        if isinstance(local_repo, str) and os.path.isdir(local_repo):
+            state["focus_repo"] = os.path.abspath(local_repo)
+            return
+        if item.get("tool") == "find_repo":
+            matches = result.get("matches") or []
+            if len(matches) == 1 and os.path.isdir(matches[0]):
+                state["focus_repo"] = os.path.abspath(matches[0])
+                return
+
+
+def _focus_snapshot(state: dict) -> dict:
+    """给 ContextBuilder/query rewrite 的一致事实；焦点切换后不混入旧扫描。"""
+    last = state.get("last_scan") or {}
+    focus = str(state.get("focus_repo") or "").strip()
+    last_repo = str(last.get("repo") or "").strip()
+    if focus and os.path.normcase(os.path.abspath(focus)) != os.path.normcase(os.path.abspath(last_repo)):
+        return {"repo": focus, "language_gap": {}, "spots": []}
+    if last:
+        return last
+    return {"repo": focus, "language_gap": {}, "spots": []} if focus else {}
+
+
 def _recent_context(chat, state: dict, max_turns: int = 4) -> str:
     """拼「会话背景」——走**同一套 ContextBuilder**（预算/去重/压缩/溯源一致）。
 
@@ -712,11 +764,12 @@ def _recent_context(chat, state: dict, max_turns: int = 4) -> str:
     这样「每一次 LLM 调用（plan/act/judge）都遵守同一套上下文纪律」。
     """
     from sentinel.cognition.context_builder import ContextTarget, default_turn_builder
-    last = state.get("last_scan")
+    last = _focus_snapshot(state)
     turns = [(m["role"], _message_text(m.get("content")))
              for m in (chat or []) if m.get("role") in ("user", "assistant")][:-1]
     repo = (last or {}).get("repo", "")
-    target = ContextTarget(repo=repo, turns=turns[-max_turns:], last_scan=last)
+    target = ContextTarget(repo=repo, focus_repo=state.get("focus_repo", ""),
+                           turns=turns[-max_turns:], last_scan=last)
     ctx = default_turn_builder(notes=_get_notes(), episodic=_get_memory()).build(target)
     return ctx.text
 
@@ -849,6 +902,7 @@ def _agent_turn(state: dict, goal: str, context: str = "", rewrite_trace: Option
             [],
         )
     run.rewrite_trace = rewrite_trace or {}
+    _stash_focus_from_run(state, run)                    # GitHub/find_repo 也能切换会话焦点
     _stash_scan_from_run(state, run)                       # 记下本轮扫描盲区，供下一轮指代
     pending = _collect(run, "permission_required")
     if pending:
@@ -907,6 +961,7 @@ def _ui_add_user(message, chat):
 
 def _ui_bot(chat, state):
     """第二步（可能耗时）：读最后一条用户消息，跑 agent / 处理授权，补回复。"""
+    logging.getLogger(__name__).info("sentinel: _ui_bot touches db")
     state = _ensure(state)
     chat = list(chat or [])
     if not chat or chat[-1].get("role") != "user":
@@ -926,7 +981,7 @@ def _ui_bot(chat, state):
         state["candidates"] = []
         ctx = _recent_context(chat, state)               # 会话背景（上次扫描 + 近期对话）
         from sentinel.cognition.query_rewrite import render_rewrite_context, rewrite_query
-        rewrite = rewrite_query(_LLM, msg, state.get("last_scan"))
+        rewrite = rewrite_query(_LLM, msg, _focus_snapshot(state))
         ctx = "\n\n".join(part for part in (ctx, render_rewrite_context(rewrite)) if part)
         reply, pending, candidates = _agent_turn(
             state, msg, context=ctx, rewrite_trace=rewrite.to_dict())

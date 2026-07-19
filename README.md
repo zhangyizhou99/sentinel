@@ -54,6 +54,20 @@ SENTINEL_BASE_URL=http://127.0.0.1:4141/v1
 
 `SENTINEL_API_KEY` 只用于满足 OpenAI 客户端的认证参数，代理当前不校验其值。启动 Sentinel 前可用 `Invoke-RestMethod http://127.0.0.1:4141/v1/models` 查看代理实际开放的模型，并将 `SENTINEL_MODEL` 改为列表中的模型 ID。
 
+### GitHub 官方远程 MCP（只读）
+
+Sentinel 可以作为 MCP Client 直连 GitHub 托管的远程 MCP Server，无需 Docker 或本地 MCP 进程。安装依赖后，在 `.env` 中显式开启：
+
+```dotenv
+SENTINEL_MCP_GITHUB_ENABLED=true
+SENTINEL_MCP_GITHUB_TOKEN=github_pat_xxxx
+SENTINEL_MCP_GITHUB_TOOLSETS=repos,pull_requests
+```
+
+默认端点为 `https://api.githubcopilot.com/mcp/`，请求固定携带 `X-MCP-Readonly: true` 与 `X-MCP-Lockdown: true`。Sentinel 还会在本地使用 allowlist 二次过滤，目前只向模型暴露仓库内容、提交、搜索和 PR 读取工具；不会开放创建 PR、评论、合并等写操作。
+
+建议使用 fine-grained PAT，只选择需要分析的仓库并授予 `Metadata: Read`、`Contents: Read`、`Pull requests: Read`。MCP 连接失败只会跳过 GitHub 工具，不影响本地扫描、RAG 和记忆。工具在 Web 进程首次使用时发现并缓存，配置或权限变更后需要重启 Sentinel。
+
 ### 本地协作原型
 
 本地版本已具备稳定的用户、工作区、任务和 checkpoint 数据模型；数据仍写入本机 `~/.cache/sentinel/episodic.db`，因此**不会跨电脑同步**。在 `.env` 里设置相同的 `SENTINEL_USER_ID` 表示同一用户；设置相同的 `SENTINEL_WORKSPACE_ID` 表示共享同一个团队工作区。

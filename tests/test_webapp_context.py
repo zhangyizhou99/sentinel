@@ -37,6 +37,54 @@ def test_gradio_rich_message_is_normalized_to_text():
     assert webapp._message_text([{"text": "补齐"}, {"text": "后重扫"}]) == "补齐\n后重扫"
 
 
+def test_github_repo_becomes_focus_without_overwriting_last_scan(tmp_path):
+    github_repo = tmp_path / "haulhero-frontend"
+    old_repo = tmp_path / "sentinel"
+    github_repo.mkdir()
+    old_repo.mkdir()
+    state = {
+        "last_scan": {"repo": str(old_repo), "language_gap": {"python": 1}, "spots": []},
+        "focus_repo": str(old_repo),
+    }
+    run = AgentRun(goal="查看 haulhero-frontend 最近一次 PR")
+    run.transcript = [{
+        "type": "action",
+        "tool": "github__list_pull_requests",
+        "observation": {"result": {"local_repo": str(github_repo), "result": {}}},
+    }]
+
+    webapp._stash_focus_from_run(state, run)
+    snapshot = webapp._focus_snapshot(state)
+
+    assert state["focus_repo"] == str(github_repo)
+    assert state["last_scan"]["repo"] == str(old_repo)
+    assert snapshot == {"repo": str(github_repo), "language_gap": {}, "spots": []}
+
+
+def test_recent_context_prefers_focus_over_stale_scan(tmp_path):
+    github_repo = tmp_path / "haulhero-frontend"
+    old_repo = tmp_path / "sentinel"
+    github_repo.mkdir()
+    old_repo.mkdir()
+    state = {
+        "focus_repo": str(github_repo),
+        "last_scan": {
+            "repo": str(old_repo),
+            "language_gap": {"python": 1},
+            "spots": [],
+        },
+    }
+
+    context = webapp._recent_context([
+        {"role": "user", "content": "查看 haulhero-frontend 最近一次 PR"},
+        {"role": "assistant", "content": "PR #1 修改了遥测。"},
+        {"role": "user", "content": "那你扫一下这个仓库吧"},
+    ], state)
+
+    assert f"focus repo: {github_repo}" in context
+    assert "语言缺口：python" not in context
+
+
 def test_explicit_scan_query_only_matches_simple_scan_requests():
     assert webapp._explicit_scan_query("扫一下haulhero-frontend") == "haulhero-frontend"
     assert webapp._explicit_scan_query("扫描 sentinel") == "sentinel"
