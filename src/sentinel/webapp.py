@@ -514,45 +514,6 @@ def _extract_path(message: str) -> Optional[str]:
     return None
 
 
-_EXPLICIT_SCAN = re.compile(
-    r"^\s*(?:扫(?:描)?(?:一下|下)?|scan)\s*[：:]?\s*`?"
-    r"(?P<query>[A-Za-z0-9_.-]+)`?\s*[。.!！]?\s*$",
-    re.IGNORECASE,
-)
-
-
-def _explicit_scan_query(message: str) -> Optional[str]:
-    """只识别无需语义推理的「扫描 + 明确项目名」请求。"""
-    match = _EXPLICIT_SCAN.fullmatch(message or "")
-    return match.group("query") if match else None
-
-
-def _fast_scan_request(state: dict, message: str):
-    """明确扫描意图走本地查找与权限门，避免授权前多次 LLM 往返。"""
-    query = _explicit_scan_query(message)
-    if not query:
-        return None
-    broker: PermissionBroker = state["broker"]
-    state["goal"] = message
-    result = build_find_repo_tool(broker).func(query)
-    matches = result.get("matches", []) if isinstance(result, dict) else []
-    if not matches:
-        return (
-            f"未在允许范围 `{broker.root}` 内找到项目 `{query}`。",
-            [],
-            [],
-        )
-    if len(matches) > 1:
-        return _format_permission_request(matches, broker, matches), matches, matches
-    target = matches[0]
-    scan_result = build_scan_tool(broker).func(target)
-    if scan_result.get("permission_required"):
-        return _format_permission_request([target], broker), [target], []
-    if scan_result.get("denied"):
-        return _format_denied([target], broker), [], []
-    return _format_scan_result(target), [], []
-
-
 # -- 授权回合：识别同意/拒绝、收集待授权请求 --------------------------------
 
 # 肯定/否定用词（中英）。授权是显式动作，不做模糊猜测，只认明确表态。
@@ -963,16 +924,12 @@ def _ui_bot(chat, state):
     else:
         state["pending"] = []
         state["candidates"] = []
-        fast_scan = _fast_scan_request(state, msg)
-        if fast_scan is not None:
-            reply, pending, candidates = fast_scan
-        else:
-            ctx = _recent_context(chat, state)           # 会话背景（上次扫描 + 近期对话）
-            from sentinel.cognition.query_rewrite import render_rewrite_context, rewrite_query
-            rewrite = rewrite_query(_LLM, msg, state.get("last_scan"))
-            ctx = "\n\n".join(part for part in (ctx, render_rewrite_context(rewrite)) if part)
-            reply, pending, candidates = _agent_turn(
-                state, msg, context=ctx, rewrite_trace=rewrite.to_dict())
+        ctx = _recent_context(chat, state)               # 会话背景（上次扫描 + 近期对话）
+        from sentinel.cognition.query_rewrite import render_rewrite_context, rewrite_query
+        rewrite = rewrite_query(_LLM, msg, state.get("last_scan"))
+        ctx = "\n\n".join(part for part in (ctx, render_rewrite_context(rewrite)) if part)
+        reply, pending, candidates = _agent_turn(
+            state, msg, context=ctx, rewrite_trace=rewrite.to_dict())
         state["pending"] = pending
         state["candidates"] = candidates
 
@@ -987,6 +944,28 @@ def _ui_approve(chat, state, selected):
     goal = _message_text(state.get("goal")).strip()
     chat.append({"role": "user", "content": f"✅ 同意扫描 `{selected or goal}`"})
     chat.append({"role": "assistant", "content": reply})
+    return chat, state, *_controls([], []), *_ignore_controls(state)
+
+
+def _ui_begin_approve(chat, state, selected):
+    """按钮点击后立即隐藏授权控件，把耗时扫描留给后续回调。"""
+    state = _ensure(state)
+    chat = list(chat or [])
+    target = selected or (state.get("pending") or [None])[0]
+    state["approved_target"] = target
+    state["pending"] = []
+    state["candidates"] = []
+    goal = _message_text(state.get("goal")).strip()
+    chat.append({"role": "user", "content": f"✅ 同意扫描 `{target or goal}`"})
+    return chat, state, *_controls([], [])
+
+
+def _ui_finish_approve(chat, state):
+    """授权控件隐藏后执行扫描，并把结果追加到对话。"""
+    state = _ensure(state)
+    chat = list(chat or [])
+    target = state.pop("approved_target", None)
+    chat.append({"role": "assistant", "content": _approve(state, target)})
     return chat, state, *_controls([], []), *_ignore_controls(state)
 
 
@@ -1059,7 +1038,12 @@ def build_demo() -> "gr.Blocks":
         msg.submit(_ui_add_user, *add_io, api_name=False).then(
             _ui_bot, [chatbot, state], outs_btn, api_name=False)
 
-        approve_btn.click(_ui_approve, [chatbot, state, cand_radio], outs_btn, api_name=False)
+        approve_btn.click(
+            _ui_begin_approve,
+            [chatbot, state, cand_radio],
+            [chatbot, state, cand_radio, approve_btn, deny_btn],
+            api_name=False,
+        ).then(_ui_finish_approve, [chatbot, state], outs_btn, api_name=False)
         deny_btn.click(_ui_deny, [chatbot, state], outs_btn, api_name=False)
         ignore_btn.click(_ui_ignore, [chatbot, state, ignore_dd], outs_btn, api_name=False)
 

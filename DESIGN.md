@@ -374,6 +374,14 @@ flowchart LR
 - **多语言**：扫描与改写分开授权能力。Python 用 `ast`，其它语言通过 tree-sitter grammar/query 动态扩展扫描；改写除语法验证外还要求项目存在可验证的真实 emitter，没有时安全拒绝，不能用 `println`/console 代替。
 - **投递状态**：apply 结果分别给出 `emitter`、`receiver_configured`、`delivery`。源码 emitter 已写入不等于 Grafana 已收到；缺 Faro URL 为 `pending_configuration`，发现 URL 但未做网络验收为 `configured_unverified`。Grafana 看板/告警部署仍属于 roadmap 第 7 步的后续能力。
 
+#### 8.3.1 最小 Apply Reflection（已落地）
+
+- **症状**：过去 apply 只证明“补丁写进去了”，不能证明目标盲区真的消失，也不能发现未选中的盲区被连带改掉。
+- **通用约束**：写盘后重新解析修改文件并重扫，要求 `after_blind_spots == before_blind_spots - units_fixed`。这里比较稳定的 `unit_id` 集合，不硬编码 HaulHero 或“必须保留 4 个”；仓库原来剩几个就验证几个。
+- **输出**：`ApplyResult.reflection` 报告语法状态、已消失的选中项、仍存在的选中项、保留的未选项、意外消失项和新增盲区；Web 显示“语法 / 修复数 / 保留数”。
+- **验证**：Apply 零参数回归 16/16 通过；Python fixture 证明只修选中的 1 个并保留未选中的 1 个；TypeScript/Faro fixture 证明写入后重扫能识别目标盲区消失。
+- **剩余边界**：这是快速确定性检查，不等价于项目完整 build/typecheck，也不验证事件已送达 Grafana；两者后续作为可选严格模式和投递验收实现。
+
 ---
 
 ## 9. 多仓库隔离（同时处理多个仓库，进度分开）
@@ -481,7 +489,7 @@ flowchart LR
 
 - **范围边界 `workspace_root`**（`config.workspace_root()`，默认 = 启动目录，`SENTINEL_WORKSPACE_ROOT` 覆盖）：`find_repo`/`scan` 只能在此根内活动，越界返回 `denied`。
 - **两级权限**：`find_repo` 只列**目录名**（低风险）→ 在 scope 内免授权；`scan` 读**代码内容**（高风险）→ 未授权返回 `permission_required`。
-- **人审同意（human-in-the-loop）**：`PermissionBroker`（按会话保存已授权路径）。Web 里授权 = 一个对话回合——agent 找到路径后停下请求授权，用户回「同意」才继续 `scan`。
+- **人审同意（human-in-the-loop）**：`PermissionBroker`（按会话保存已授权路径）。Web 里授权 = 一个对话回合——agent 找到路径后停下请求授权，用户回「同意」才继续 `scan`。按钮采用两段回调：第一段立即清空待授权状态并隐藏授权控件，第二段才执行扫描/Judge，避免耗时期间授权框滞留。
 - **不可自我提权**：`broker.grant()` 只接受 scope 内路径；越界授权直接 `PermissionError`。
 - **隐含同意例外**：CLI `sentinel scan <path>`（用户显式发起）不设门（`build_scan_tool(broker=None)`）。
 

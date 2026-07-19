@@ -328,6 +328,7 @@ def build_apply_tool(broker: Optional[PermissionBroker] = None, memory=None,
             "receiver_configured": res.receiver_configured,
             "delivery": res.delivery,
             "delivery_note": res.delivery_note,
+            "reflection": res.reflection,
             "message": res.message,
         }}
 

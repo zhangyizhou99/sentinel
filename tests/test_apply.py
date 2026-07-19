@@ -157,6 +157,28 @@ def test_apply_tool_executes_selected_target():
     ast.parse(txt)
 
 
+def test_apply_reflection_preserves_unselected_blind_spots():
+    from sentinel.engines.agent_tools import build_apply_tool
+
+    d = _make_repo()
+    with (d / "svc.py").open("a", encoding="utf-8") as source:
+        source.write("\ndef load_cargo():\n    return db.query('cargo')\n")
+    _git(d, "add", ".")
+    _git(d, "commit", "-qm", "add second blind spot")
+
+    out = build_apply_tool().func({
+        "repo": str(d), "targets": "checkin", "branch": "reflect",
+    })["applied"]
+
+    reflection = out["reflection"]
+    assert reflection["passed"] is True
+    assert reflection["syntax_passed"] is True
+    assert reflection["selected_resolved"] == ["svc.py::checkin"]
+    assert reflection["unselected_preserved"] == ["svc.py::load_cargo"]
+    assert reflection["unexpected_resolved"] == []
+    assert reflection["new_blind_spots"] == []
+
+
 def test_apply_tool_uses_available_suffix_when_branch_exists():
     from sentinel.engines.agent_tools import build_apply_tool
 

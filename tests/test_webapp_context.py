@@ -76,6 +76,23 @@ def test_approve_callback_returns_updated_state(monkeypatch):
     assert result[0][-1]["content"] == "扫描完成"
 
 
+def test_approve_button_hides_controls_before_scan(monkeypatch):
+    state = {
+        "pending": ["d:/Code/haulhero-frontend"],
+        "candidates": [],
+        "goal": "扫一下 haulhero-frontend",
+    }
+    monkeypatch.setattr(webapp, "_ensure", lambda value: value)
+
+    result = webapp._ui_begin_approve([], state, None)
+
+    assert state["approved_target"] == "d:/Code/haulhero-frontend"
+    assert state["pending"] == []
+    assert result[2]["visible"] is False
+    assert result[3]["visible"] is False
+    assert result[4]["visible"] is False
+
+
 def test_web_embedder_uses_configured_fallback(monkeypatch):
     marker = object()
     monkeypatch.setattr(webapp, "_EMBEDDER", None)
