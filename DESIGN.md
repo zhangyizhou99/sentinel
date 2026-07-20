@@ -84,7 +84,7 @@ flowchart TB
 | 3 | 记忆与检索 RAG | 8 | 切块→向量化→检索 | 大仓 top-K 召回正确函数 |
 | 4 | 上下文工程 | 9 | 证据拼装 + token 预算 | 判定 prompt 只喂 top-K + 引用 |
 | 5 | 造框架 | 6/7 | Agent/Tool/Memory/LLM 接口 | 重构后测试不回归 |
-| 6 | git 增量 + 漂移 | — | `--changed` + `git blame` 路由 | diff 驱动，作者可定位 |
+| 6 | git 增量 + 漂移 | — | `--changed`（已落地）+ `git blame` 路由（待做） | diff 驱动，作者可定位 |
 | 7 | 生成 + 部署 | — | 埋点/告警/看板 → Grafana + Slack | 真实闭环（复用 legacy 逻辑） |
 | 8 | 评估 | 12 | fixtures + P/R/F1 | 召回率有数字 |
 | 9 | 通信协议 | 10 | MCP server | 被别的 agent 调用 |
@@ -407,7 +407,7 @@ flowchart LR
 ## 10. 漂移检测与同步（别人改了怎么发现 / 怎么自己同步）
 
 ### 10.1 检测
-- **git 增量**：`git diff <last_seen>..HEAD --name-only` + 只解析改动的函数（`--changed`）。
+- **git 增量（已落地）**：`engines/gitscan.py`。取 `merge-base(base, HEAD)`（base 默认 main→master）为分叉点，`git diff --unified=0 <分叉点>` 解析改动行号（含 已提交+暂存+未提交），未跟踪新文件另行纳入；改动行 ∩ 函数行区间 → **只报你真正动到的函数**的盲区。入口：`sentinel scan <repo> --changed [--base X]` 与对话工具 `scan_changed`。
 - **内容哈希签名**：每个 `CodeUnit` 存 `content_hash`；**没变的跳过**（不重复处理、不重复调 LLM）。
 - **基线对比**：改动函数的可观测性 < Baseline → 记为 **Drift**。
 

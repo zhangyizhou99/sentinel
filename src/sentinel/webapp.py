@@ -43,6 +43,7 @@ from sentinel.engines.agent import AgentCore, AgentRun
 from sentinel.engines.agent_tools import (
     build_find_repo_tool,
     build_scan_tool,
+    build_scan_changed_tool,
     build_check_language_tool,
     build_install_language_tool,
     build_register_dynamic_language_tool,
@@ -158,6 +159,7 @@ def _build_agent(broker: PermissionBroker) -> AgentCore:
     notes = _get_notes()
     find = build_find_repo_tool(broker)
     scan = build_scan_tool(broker, memory=mem, notes=notes)  # 带记忆：抑制被拒的 + 记录运行 + 学埋点约定
+    scan_changed = build_scan_changed_tool(broker, memory=mem)  # git 增量：只扫本分支改动到的函数
     check = build_check_language_tool(broker)             # 只读：报告语言覆盖缺口
     install = build_install_language_tool(_LLM)           # 破坏性：须用户明确同意后才补齐
     register_language = build_register_dynamic_language_tool(_LLM)
@@ -168,7 +170,7 @@ def _build_agent(broker: PermissionBroker) -> AgentCore:
     telemetry_plan = build_telemetry_plan_tool(broker)
     dashboard = build_dashboard_tool(broker)
     deploy_dashboard = build_deploy_dashboard_tool(broker)
-    tools = {t.name: t for t in (find, scan, check, install, register_language, ignore, add_note, recall, apply, telemetry_plan, dashboard, deploy_dashboard)}
+    tools = {t.name: t for t in (find, scan, scan_changed, check, install, register_language, ignore, add_note, recall, apply, telemetry_plan, dashboard, deploy_dashboard)}
     tools.update(_get_mcp_tools())
     return AgentCore(_LLM, tools=tools)
 
@@ -179,7 +181,7 @@ def _scan_reports(run: AgentRun) -> List[dict]:
     """从 transcript 里取出 scan 工具的真实观测（ground truth，不用 LLM 改写过的答案）。"""
     reports: List[dict] = []
     for item in run.transcript:
-        if item.get("type") == "action" and item.get("tool") == "scan":
+        if item.get("type") == "action" and item.get("tool") in ("scan", "scan_changed"):
             obs = item.get("observation", {})
             if isinstance(obs.get("result"), dict):
                 reports.append(obs["result"])
@@ -557,7 +559,7 @@ def _collect(run: AgentRun, key: str) -> List[str]:
     """从 transcript 的 scan 观测里收集带某个 key 的路径（permission_required / denied）。"""
     out: List[str] = []
     for item in run.transcript:
-        if item.get("type") == "action" and item.get("tool") == "scan":
+        if item.get("type") == "action" and item.get("tool") in ("scan", "scan_changed"):
             res = item.get("observation", {}).get("result", {})
             if isinstance(res, dict) and res.get(key) and res[key] not in out:
                 out.append(res[key])

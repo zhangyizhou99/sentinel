@@ -225,6 +225,76 @@ def build_scan_tool(broker: Optional[PermissionBroker] = None, memory=None, note
     return Tool("scan", _SCAN_DESC, _scan)
 
 
+_SCAN_CHANGED_DESC = (
+    "scan_changed(repo, base) — 只扫「你这条分支相对 base（默认 main）改动过的函数」的监控盲区。"
+    "适合『我这条 branch 改了啥 / 帮我扫这次的改动 / 只看我新写的代码』。范围含 已提交+暂存+未提交+未跟踪新文件；"
+    "粒度是 diff 改动行 ∩ 函数区间——只报你**真正动到**的函数，不报整仓。输入 repo=仓库绝对路径"
+    "（可先用 find_repo）；base 留空=默认 main（不存在退 master）。会读文件内容，需先授权；未授权返回 "
+    "permission_required。仅当用户明确要「扫改动/扫这条分支/扫这次提交」时用；否则用普通 scan。 | "
+    "scan_changed(repo, base): scan only functions changed on this branch vs base (default main); "
+    "covers committed+staged+unstaged+untracked new files; reports only touched functions. Needs consent."
+)
+
+
+def build_scan_changed_tool(broker: Optional[PermissionBroker] = None, memory=None) -> Tool:
+    """构造 scan_changed 工具：git 增量扫描（只报改动到的函数的盲区）。"""
+    def _scan_changed(args) -> Dict[str, Any]:
+        if not isinstance(args, dict):
+            args = {"repo": str(args)}
+        repo = _clean(args.get("repo", "")) or (memory.last_repo if memory else "") or ""
+        base = _clean(args.get("base", "")) or None
+        if not repo:
+            return {"error": "需要仓库路径 | repo path required"}
+        if not os.path.exists(repo):
+            return {"error": f"路径不存在: {repo}"}
+        if broker is not None:
+            if not broker.within_scope(repo):
+                return {"denied": os.path.abspath(repo), "reason": "超出允许的工作区范围"}
+            if not broker.is_granted(repo):
+                return {"permission_required": os.path.abspath(repo),
+                        "reason": "读取该仓库代码需要用户授权 | consent needed to read this code"}
+        from sentinel.engines.gitscan import GitScanError, scan_changed_repo
+        try:
+            result, base_ref = scan_changed_repo(repo, base)
+        except GitScanError as exc:
+            return {"error": str(exc)}
+        spots = result.blind_spots
+        suppressed = 0
+        if memory is not None:
+            ignored = memory.ignored_units(repo)
+            if ignored:
+                kept = [u for u in spots if u.unit_id not in ignored]
+                suppressed = len(spots) - len(kept)
+                spots = kept
+        return {
+            "repo": repo,
+            "base": (base or "main"),
+            "base_ref": base_ref[:12],
+            "total_units": len(result.units),      # 本次改动到的函数数（复用渲染器字段名）
+            "blind_spot_count": len(spots),
+            "suppressed_count": suppressed,
+            "blind_spots": [
+                {
+                    "file": u.file,
+                    "function": u.qualname,
+                    "unit_id": u.unit_id,
+                    "signals": signals_of(u),
+                    "lines": f"{u.start_line}-{u.end_line}",
+                }
+                for u in spots[:_MAX_REPORTED]
+            ],
+        }
+
+    params = {
+        "type": "object",
+        "properties": {
+            "repo": {"type": "string", "description": "仓库绝对路径（可留空=最近扫描的）"},
+            "base": {"type": "string", "description": "对比基准分支，默认 main（不存在退 master）"},
+        },
+    }
+    return Tool("scan_changed", _SCAN_CHANGED_DESC, _scan_changed, parameters=params, structured=True)
+
+
 # ---- apply_instrumentation：提议给盲区补埋点（破坏性，但只提议不改代码）------------
 
 _APPLY_DESC = (

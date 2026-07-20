@@ -40,13 +40,25 @@ def cmd_ping(args: argparse.Namespace) -> None:
 
 
 def cmd_scan(args: argparse.Namespace) -> None:
-    """扫描仓库，列出监控盲区（纯静态，不用 LLM）。
+    """扫描仓库/文件，列出监控盲区（纯静态，不用 LLM）。
 
     带上情节记忆：抑制此前被标为「不用埋点」的函数（反馈学习），并记录本次运行。
+    --changed：只扫相对 base 分支（默认 main）改动过的函数（git 增量）。
     """
     _register_languages()
     memory = EpisodicMemory()
-    result = scan_repo(args.repo)
+    base_note = ""
+    if getattr(args, "changed", False):
+        from sentinel.engines.gitscan import GitScanError, scan_changed_repo
+        try:
+            result, base_ref = scan_changed_repo(args.repo, args.base)
+        except GitScanError as exc:
+            print(f"❌ {exc}")
+            memory.close()
+            return
+        base_note = f"（git 增量：相对 {args.base or 'main'} 分叉点 {base_ref[:12]}，只看改动到的函数）"
+    else:
+        result = scan_repo(args.repo)
     spots = result.blind_spots
 
     ignored = memory.ignored_units(args.repo)
@@ -55,7 +67,7 @@ def cmd_scan(args: argparse.Namespace) -> None:
     spots = kept
 
     note = f"（已抑制 {suppressed} 个你此前标记忽略的函数）" if suppressed else ""
-    print(f"扫描 {args.repo}：共 {len(result.units)} 个函数/方法，"
+    print(f"扫描 {args.repo}{base_note}：共 {len(result.units)} 个函数/方法，"
           f"发现 {len(spots)} 个监控盲区{note}\n")
     for u in spots:
         sigs = "/".join(signals_of(u))
@@ -194,7 +206,11 @@ def build_parser() -> argparse.ArgumentParser:
     ping.set_defaults(func=cmd_ping)
 
     scan = sub.add_parser("scan", help="扫描仓库，列出监控盲区（纯静态，不用 LLM）")
-    scan.add_argument("repo", help="仓库路径或单个 .py 文件")
+    scan.add_argument("repo", help="仓库路径或单个文件")
+    scan.add_argument("--changed", action="store_true",
+                      help="只扫相对 base 分支改动过的函数（git 增量：已提交+暂存+未提交+新文件）")
+    scan.add_argument("--base", default=None,
+                      help="git 增量的对比基准分支，默认 main（不存在退 master）")
     scan.set_defaults(func=cmd_scan)
 
     fb = sub.add_parser("feedback", help="标记某函数是否需要埋点；反馈在下次 scan 生效")
