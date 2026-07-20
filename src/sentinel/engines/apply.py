@@ -1,11 +1,11 @@
 """补埋点应用引擎（Restore）—— 见 DESIGN §8.3。
 
-把 scan 出的盲区函数变成对源码的**真实修改**，落在一个用户命名的新 git 分支上，
-并**保持未提交**（留成工作区改动，让人在编辑器里看/审/改，再自己决定提交或丢弃）。
-原分支不受影响：不满意就 `git checkout <base>` 再删分支，毫无损失。
+把 scan 出的盲区函数变成对源码的**真实修改**，**直接写回工作区文件、保持未提交**
+（不建分支、不切分支、不提交），让人在编辑器里看/审/改，再自己决定 commit 或丢弃。
+支持增量：先补几个、再补几个，都是往当前文件继续改（不要求干净工作区）。
 
-git 安全机制沿用 legacy `apply.py`（成熟）：是 git 仓库 / 工作区干净 / 分支不存在 三前置检查，
-新分支 + 未提交 + `git add -N` 让新文件也进 diff。改写用函数级 `instrument_editor`（AST 安全网 + 幂等）。
+改写用函数级 `instrument_editor`（AST 安全网 + 幂等）。git 是可选的：是 git 仓库时
+用 `git add -N` + `git diff` 生成预览；不满意用 `git checkout -- <文件>` 撤销；非 git 仓库也能改。
 """
 from __future__ import annotations
 
@@ -43,8 +43,6 @@ class _SnippetCandidate:
 
 @dataclass
 class ApplyResult:
-    branch: str
-    base_branch: str
     units_fixed: List[str] = field(default_factory=list)   # 成功补埋点的 unit_id
     files_changed: List[str] = field(default_factory=list)
     skipped: List[str] = field(default_factory=list)       # 跳过的 unit_id（非 py / 改写不安全）
@@ -208,43 +206,40 @@ def _build_snippet(repo: Path, target: Path, source: str, unit,
 
 
 class Applier:
-    """把盲区函数补埋点提交到新建 git 分支（未提交，待人审）。"""
+    """把盲区函数补埋点**直接写回工作区文件**（未提交、不建分支，待人审）。"""
 
     def __init__(self, llm=None):
         self.llm = llm
 
-    def apply(self, repo, units, branch: str, convention=None, procedural=None) -> ApplyResult:
+    def apply(self, repo, units, convention=None, procedural=None) -> ApplyResult:
         repo = Path(repo).resolve()
-        branch = (branch or "").strip()
-        if not branch:
-            raise ApplyError("需要分支名（请自己输入）| branch name required")
         if not units:
             raise ApplyError("无盲区可补 | no blind spots to fix")
         if not any(getattr(unit, "language", "") for unit in units):
             raise ApplyError("这些盲区缺少已验证的语言信息，无法安全自动改写。")
 
-        self._require_git_repo(repo)
-        self._require_clean(repo)
-        base = self._current_branch(repo)
-        self._require_new_branch(repo, branch)
+        is_git = self._is_git_repo(repo)
         before_ids = {unit.unit_id for unit in self._blind_spots(repo)}
 
-        result = ApplyResult(branch=branch, base_branch=base)
+        result = ApplyResult()
         planned = self._plan_edits(repo, units, convention, procedural, result)
         if not planned:
             reasons = "；".join(sorted(set(result.skipped_reasons.values())))
             detail = f" 原因：{reasons}" if reasons else ""
             raise ApplyError(f"没有生成任何通过语法验证的补丁，仓库未修改。{detail}")
-        self._git(repo, ["checkout", "-b", branch])
+
+        # 直接写回工作区文件：不建分支、不提交、不要求干净工作区。
+        # 增量友好——第二次补是在上一批（未提交）改动之上继续改同一批文件。
         for path, source in planned.items():
             path.write_text(source, encoding="utf-8")
             result.files_changed.append(str(path.relative_to(repo)))
         result.reflection = self._reflect(repo, units, result, before_ids)
-        self._git(repo, ["add", "-N", "."])
-        result.diff = self._git(repo, ["diff"]).stdout
+        if is_git:
+            self._git(repo, ["add", "-N", "."], check=False)   # 让新文件也进 diff
+            result.diff = self._git(repo, ["diff"], check=False).stdout
         result.message = (
-            f"已切换到新分支 '{branch}'，{len(result.files_changed)} 个文件补了埋点，"
-            f"**未提交**——去编辑器里看/改，再自行提交或丢弃（原分支 '{base}'）。 "
+            f"已直接修改 {len(result.files_changed)} 个文件补埋点（**未提交**，留成工作区改动）。"
+            f"去编辑器里看/改，满意就自己 commit，不满意用 `git checkout -- <文件>` 撤销。 "
             f"Emitter: {result.emitter or 'unknown'}；delivery: {result.delivery}。"
         )
         return result
@@ -380,24 +375,14 @@ class Applier:
                 planned[path] = source
         return planned
 
-    # -- git 前置检查（沿用 legacy）------------------------------------------
+    # -- git 可选：仅用于生成 diff 预览（不建分支、不要求干净工作区）--------------
 
-    def _require_git_repo(self, repo: Path) -> None:
-        r = self._git(repo, ["rev-parse", "--is-inside-work-tree"], check=False)
-        if r.returncode != 0 or r.stdout.strip() != "true":
-            raise ApplyError(f"不是 git 仓库 | not a git repo: {repo}")
-
-    def _require_clean(self, repo: Path) -> None:
-        if self._git(repo, ["status", "--porcelain"]).stdout.strip():
-            raise ApplyError("工作区不干净，请先提交或 stash | working tree not clean")
-
-    def _require_new_branch(self, repo: Path, branch: str) -> None:
-        r = self._git(repo, ["rev-parse", "--verify", branch], check=False)
-        if r.returncode == 0:
-            raise ApplyError(f"分支已存在 | branch already exists: {branch}（请换个名字）")
-
-    def _current_branch(self, repo: Path) -> str:
-        return self._git(repo, ["rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
+    def _is_git_repo(self, repo: Path) -> bool:
+        try:
+            r = self._git(repo, ["rev-parse", "--is-inside-work-tree"], check=False)
+        except ApplyError:
+            return False   # 未装 git 也能只改文件，只是没有 diff 预览
+        return r.returncode == 0 and r.stdout.strip() == "true"
 
     def _git(self, repo: Path, args: List[str], check: bool = True) -> subprocess.CompletedProcess:
         try:

@@ -164,10 +164,10 @@ def _build_agent(broker: PermissionBroker) -> AgentCore:
     ignore = build_feedback_tool(mem)                     # 反馈学习：标为不用埋点→下次抑制
     add_note = build_note_tool(notes, mem)               # 记团队笔记 → 判定上下文一等证据
     recall = build_recall_notes_tool(notes, mem)         # 查团队笔记
-    apply = build_apply_tool(broker, memory=mem, notes=notes, procedural=_get_procedural(), llm=_LLM)  # 结构化执行器：LLM 填 targets/branch，直接补到新分支未提交
+    apply = build_apply_tool(broker, memory=mem, notes=notes, procedural=_get_procedural(), llm=_LLM)  # 结构化执行器：LLM 填 targets，直接改文件未提交
     telemetry_plan = build_telemetry_plan_tool(broker)
     dashboard = build_dashboard_tool(broker)
-    deploy_dashboard = build_deploy_dashboard_tool()
+    deploy_dashboard = build_deploy_dashboard_tool(broker)
     tools = {t.name: t for t in (find, scan, check, install, register_language, ignore, add_note, recall, apply, telemetry_plan, dashboard, deploy_dashboard)}
     tools.update(_get_mcp_tools())
     return AgentCore(_LLM, tools=tools)
@@ -815,14 +815,8 @@ def _collect_apply_proposal(run):
     return None
 
 
-def _extract_branch(msg: str) -> str:
-    """从用户消息里抽出分支名（如 fix/obs、sentinel-x）；抽不到返回空。"""
-    m = re.findall(r"[A-Za-z][\w./\-]*", msg or "")
-    return m[-1] if m else ""
-
-
-def _do_apply(repo: str, branch: str) -> str:
-    """真正执行补埋点：扫盲区→学约定→Applier 补到新分支（未提交）→回 diff。"""
+def _do_apply(repo: str) -> str:
+    """真正执行补埋点：扫盲区→学约定→Applier 直接改文件（未提交）→回 diff。"""
     from sentinel.engines.apply import Applier, ApplyError
     from sentinel.engines.conventions import learn_convention
     mem = _get_memory()
@@ -833,10 +827,9 @@ def _do_apply(repo: str, branch: str) -> str:
         return "没有需要补埋点的盲区了。"
     conv = learn_convention(repo, result.units)
     try:
-        res = Applier(llm=_LLM).apply(repo, spots, branch, convention=conv, procedural=_get_procedural())
+        res = Applier(llm=_LLM).apply(repo, spots, convention=conv, procedural=_get_procedural())
     except ApplyError as e:
-        return (f"❌ 无法补埋点：{e}\n\n"
-                "（apply 需要一个干净的 git 仓库；想换分支名可以再说「补一下」并指定名字。）")
+        return f"❌ 无法补埋点：{e}"
     lines = [f"✅ {res.message}"]
     if res.units_fixed:
         lines.append(f"已补 {len(res.units_fixed)} 个：{', '.join(res.units_fixed)}")
@@ -855,17 +848,12 @@ def _do_apply(repo: str, branch: str) -> str:
 
 
 def _handle_apply_reply(state: dict, msg: str) -> str:
-    """处理用户对「分支名确认」的回应：取消 / 用建议名 / 用户指定名 → 执行或取消。"""
+    """处理用户对补埋点确认的回应：取消 / 确认 → 直接改文件 或 取消。"""
     prop = state.get("pending_apply") or {}
     state["pending_apply"] = None
     if _is_negative(msg):
         return "好的，已取消，不补埋点。"
-    branch = prop.get("suggested_branch", "")
-    if not _is_affirmative(msg):
-        branch = _extract_branch(msg) or branch
-    if not branch:
-        return "没拿到分支名，取消补埋点。"
-    return _do_apply(prop.get("repo", ""), branch)
+    return _do_apply(prop.get("repo", ""))
 
 
 def _agent_turn(state: dict, goal: str, context: str = "", rewrite_trace: Optional[dict] = None):
@@ -1072,7 +1060,9 @@ def build_demo() -> "gr.Blocks":
             "结果里的文件名可**点击在 VS Code 打开**。"
         )
         state = gr.State({})
-        chatbot = gr.Chatbot(height=440, label="Sentinel", buttons=["copy"])
+        # 用自适应高度替代固定 height：内容多时长到 max_height 再由外层滚动，
+        # 避免长表格在气泡内形成嵌套滚动导致「滑不动、下面看不到」。resizable 让用户还能手动拖高。
+        chatbot = gr.Chatbot(label="Sentinel", min_height=440, max_height=820, resizable=True)
         cand_radio = gr.Radio(choices=[], visible=False, label="找到多个匹配，选一个授权：")
         with gr.Row():
             approve_btn = gr.Button("✅ 同意扫描", variant="primary", visible=False)

@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
 from typing import Any, Dict, Optional
 
 from sentinel.engines.agent import Tool
@@ -229,35 +228,18 @@ def build_scan_tool(broker: Optional[PermissionBroker] = None, memory=None, note
 # ---- apply_instrumentation：提议给盲区补埋点（破坏性，但只提议不改代码）------------
 
 _APPLY_DESC = (
-    "apply_instrumentation(targets, branch, repo) —— 【给盲区补埋点，会改代码，破坏性】"
-    "对仓库监控盲区函数补埋点，改动落到一个新 git 分支、**未提交**（用户可 review diff 后自己提交或丢弃，原分支不动，安全）。\n"
+    "apply_instrumentation(targets, repo) —— 【给盲区补埋点，会直接改代码文件，破坏性】"
+    "对仓库监控盲区函数补埋点，改动**直接写回源文件、未提交**（不建分支；用户在编辑器里 review，"
+    "满意就自己 commit，不满意 `git checkout -- 文件` 撤销）。可多次增量调用：先补几个、再补几个。\n"
     "参数：targets=补哪些（留空=全部；或逗号分隔的函数名/关键词，如 'checkin' 或 'checkin,load_cargo'）——"
     "用户说「只补第一个 / 前两个 / 除了 X 都补」时，你要先看扫描结果把它对应到具体函数名再填；"
-    "branch=分支名（用户指定就用，没说留空=用建议名）；repo=仓库路径（一般是最近扫的，可留空）。\n"
+    "repo=仓库路径（一般是最近扫的，可留空）。\n"
     "仅当用户明确要补埋点/修复盲区时调用。Python 会遵循项目日志约定；JS/TS/TSX 仅在项目"
     "已有官方 Grafana Faro SDK + recordObservability/pushEvent helper 时自动改写，绝不以"
     "console.info 冒充遥测。结果会分别报告 emitter、receiver_configured 与 delivery；"
     "源码已改不等于 Grafana 已收到。其它语言可扫描，但没有可验证 emitter 时会安全拒绝改写。 | "
-    "apply_instrumentation: instrument blind-spot functions; edits land on a new uncommitted git branch."
+    "apply_instrumentation: instrument blind-spot functions by editing files in place (uncommitted, no branch)."
 )
-
-
-def _available_branch(repo: str, base: str) -> str:
-    """返回一个尚不存在的分支名，避免失败遗留分支阻塞重试。"""
-    candidate = base
-    suffix = 2
-    while os.path.exists(os.path.join(repo, ".git")) and subprocess.run(
-            ["git", "-C", repo, "rev-parse", "--verify", candidate],
-            capture_output=True, text=True, check=False).returncode == 0:
-        candidate = f"{base}-{suffix}"
-        suffix += 1
-    return candidate
-
-
-def _suggest_branch(repo: str) -> str:
-    """给一个未占用的建议分支名：sentinel/instrument-<仓库名>。"""
-    name = os.path.basename(os.path.abspath(repo).rstrip(os.sep)) or "repo"
-    return _available_branch(repo, f"sentinel/instrument-{name}")
 
 
 def _select_targets(spots, targets: str):
@@ -284,8 +266,9 @@ def build_apply_tool(broker: Optional[PermissionBroker] = None, memory=None,
                      notes=None, procedural=None, llm=None) -> Tool:
     """构造 apply_instrumentation 工具（**结构化执行器**）。
 
-    LLM 从用户的话 + 扫描结果里填 branch/targets（意图理解归 LLM）；工具按 targets 确定性过滤
-    盲区并真执行 Applier（改代码到新分支未提交）。安全网 = git 新分支未提交（用户 review diff 后 commit/丢弃）。
+    LLM 从用户的话 + 扫描结果里填 targets（意图理解归 LLM）；工具按 targets 确定性过滤
+    盲区并真执行 Applier（**直接改代码到工作区文件、未提交**）。支持多次增量补：先补几个、再补几个。
+    安全网 = 未提交 + diff 预览（用户 review 后 commit / `git checkout --` 丢弃）。
     """
     def _apply(args) -> Dict[str, Any]:
         if not isinstance(args, dict):
@@ -309,18 +292,14 @@ def build_apply_tool(broker: Optional[PermissionBroker] = None, memory=None,
         if not selected:
             return {"error": f"没找到匹配「{targets}」的盲区；可选："
                              + ", ".join(u.unit_id for u in spots[:10])}
-        requested_branch = (args.get("branch") or "").strip()
-        branch = (_available_branch(repo, requested_branch) if requested_branch
-              else _suggest_branch(repo))
         from sentinel.engines.apply import Applier, ApplyError
         from sentinel.engines.conventions import learn_convention
         conv = learn_convention(repo, result.units)
         try:
-            res = Applier(llm=llm).apply(repo, selected, branch, convention=conv, procedural=procedural)
+            res = Applier(llm=llm).apply(repo, selected, convention=conv, procedural=procedural)
         except ApplyError as e:
             return {"error": str(e)}
         return {"applied": {
-            "branch": res.branch, "base_branch": res.base_branch,
             "units_fixed": res.units_fixed, "skipped": res.skipped,
             "skipped_reasons": res.skipped_reasons,
             "files_changed": res.files_changed, "diff": res.diff[:3000],
@@ -338,8 +317,6 @@ def build_apply_tool(broker: Optional[PermissionBroker] = None, memory=None,
             "targets": {"type": "string", "description":
                         "补哪些盲区：留空=全部；或逗号分隔的函数名/关键词（如 checkin 或 checkin,load_cargo）。"
                         "用户说「第一个/前两个/除了X」时，先看扫描结果把它对应到具体函数名再填。"},
-            "branch": {"type": "string", "description":
-                       "补埋点落到的新 git 分支名（用户指定就用，没说留空=用建议名）"},
             "repo": {"type": "string", "description": "仓库绝对路径（一般是最近扫描的，可留空）"},
         },
     }
@@ -367,13 +344,15 @@ def build_telemetry_plan_tool(broker: Optional[PermissionBroker] = None) -> Tool
 
 
 _DASHBOARD_DESC = (
-    "gen_dashboard(repo, datasource_uid) — 从仓库当前的 telemetry plan 生成 Grafana dashboard JSON，"
-    "不部署。datasource_uid 可留空，届时结果会明确标记为未绑定数据源。"
+    "gen_dashboard(repo, targets, datasource_uid) —— 为【已埋点函数】生成 Grafana dashboard JSON，"
+    "不部署。覆盖 sentinel 刚补的和项目本来就有 log 的函数；只有真正会发日志的函数才会进面板。"
+    "targets 指定要哪些（留空=全部已埋点；或逗号分隔的函数名/关键词/文件名，如 'queue' 或 'flush,enqueue'）；"
+    "datasource_uid 可留空，届时结果会明确标记为未绑定数据源。"
 )
 
 
 def build_dashboard_tool(broker: Optional[PermissionBroker] = None) -> Tool:
-    from sentinel.engines.grafana import generate_dashboard, generate_telemetry_plan
+    from sentinel.engines.grafana import generate_dashboard, plan_dashboard
 
     def _dashboard(args) -> Dict[str, Any]:
         if not isinstance(args, dict):
@@ -383,13 +362,15 @@ def build_dashboard_tool(broker: Optional[PermissionBroker] = None) -> Tool:
             return {"denied": os.path.abspath(repo), "reason": "超出允许的工作区范围"}
         if not os.path.exists(repo):
             return {"error": f"路径不存在: {repo}"}
-        plan = generate_telemetry_plan(repo)
+        plan = plan_dashboard(repo, _clean(args.get("targets", "")))
         return {"plan": plan, **generate_dashboard(plan, _clean(args.get("datasource_uid", "")))}
 
     return Tool("gen_dashboard", _DASHBOARD_DESC, _dashboard, parameters={
         "type": "object",
         "properties": {
             "repo": {"type": "string", "description": "仓库绝对路径"},
+            "targets": {"type": "string", "description":
+                        "要监控哪些已埋点函数：留空=全部；或逗号分隔的函数名/关键词/文件名，如 'queue'"},
             "datasource_uid": {"type": "string", "description": "Grafana datasource UID，可留空"},
         },
         "required": ["repo"],
@@ -397,29 +378,63 @@ def build_dashboard_tool(broker: Optional[PermissionBroker] = None) -> Tool:
 
 
 _DEPLOY_DASHBOARD_DESC = (
-    "deploy_dashboard(dashboard, folder_uid) — 【破坏性】通过 Grafana HTTP Provisioning API 幂等 upsert "
-    "已审阅的 dashboard JSON。仅当用户明确要求部署且已配置 GRAFANA_URL/GRAFANA_TOKEN 时调用。"
+    "deploy_dashboard(repo, targets, approved) — 【破坏性】把已埋点函数的看板部署到 Grafana，"
+    "内部自己生成 dashboard 再幂等 upsert，**不需要你传 dashboard JSON**。"
+    "【重要·别过度确认】只要用户已表达部署意图并给了范围——包括『把这几个部署』『部署你补的/刚补的』"
+    "『部署 X 和 Y』『全部部署』——就【立即】用对应 targets + approved=true 调用本工具，"
+    "**不要再反问『是否全部』，也不要反问『URL/Token 配了没』**（凭据由工具自己检查，缺了会报错回来）。"
+    "『这几个/你补的/刚补的』= 最近扫描或补埋点里 source=sentinel 的那些函数，把它们的函数名逗号拼进 targets。"
+    "targets：逗号分隔的函数名/关键词/文件名，如 'read,write,queuedPost'；用户明说『全部』才传 'all'；"
+    "**只有用户完全没提要哪些时才留空 targets**（工具会列候选让用户选，绝不默认全建）。"
+    "approved：用户已明确要部署即为 true。"
 )
 
 
-def build_deploy_dashboard_tool() -> Tool:
-    from sentinel.engines.grafana import deploy_dashboard
+def build_deploy_dashboard_tool(broker: Optional[PermissionBroker] = None) -> Tool:
+    from sentinel.engines.grafana import plan_dashboard, generate_dashboard, deploy_dashboard
 
     def _deploy(args) -> Dict[str, Any]:
-        if not isinstance(args, dict) or not isinstance(args.get("dashboard"), dict):
-            return {"ok": False, "reason": "需要经过审阅的 dashboard JSON 对象"}
+        if not isinstance(args, dict):
+            return {"ok": False, "reason": "参数格式不对"}
         if args.get("approved") is not True:
-            return {"ok": False, "reason": "dashboard 部署需要用户明确审批（approved=true）；未发起部署。"}
-        return deploy_dashboard(args["dashboard"], _clean(args.get("folder_uid", "")))
+            return {"ok": False, "reason": "部署到 Grafana 需要用户明确同意（approved=true）；未发起部署。"}
+        repo = _clean(args.get("repo", ""))
+        if broker is not None and not broker.within_scope(repo):
+            return {"ok": False, "denied": os.path.abspath(repo), "reason": "超出允许的工作区范围"}
+        if not os.path.exists(repo):
+            return {"ok": False, "error": f"路径不存在: {repo}"}
+        targets = _clean(args.get("targets", ""))
+        # 破坏性部署不默认全建：targets 空时先列候选让用户点名（除非显式说 all）。
+        if not targets:
+            candidates = [event["event"] for event in plan_dashboard(repo, "").get("events", [])]
+            return {
+                "ok": False, "needs_targets": True, "candidates": candidates,
+                "reason": (f"未指定要部署哪些，该仓库有 {len(candidates)} 个已埋点函数可建面板："
+                           f"{', '.join(candidates) or '无'}。请点名要哪几个（函数名/关键词），"
+                           f"或明确说“全部”。破坏性部署不默认全建。"),
+            }
+        plan = plan_dashboard(repo, targets)
+        if not plan.get("events"):
+            candidates = [event["event"] for event in plan_dashboard(repo, "").get("events", [])]
+            return {"ok": False, "reason": f"没有匹配「{targets}」的已埋点函数。可选：{', '.join(candidates) or '无'}",
+                    "candidates": candidates}
+        built = generate_dashboard(plan, _clean(args.get("datasource_uid", "")))
+        result = deploy_dashboard(built["dashboard"], _clean(args.get("folder_uid", "")))
+        result["panels"] = [event["event"] for event in plan["events"]]
+        result["imprecise_panels"] = built.get("imprecise_panels", [])
+        return result
 
     return Tool("deploy_dashboard", _DEPLOY_DASHBOARD_DESC, _deploy, parameters={
         "type": "object",
         "properties": {
-            "dashboard": {"type": "object", "description": "gen_dashboard 返回的 dashboard JSON"},
+            "repo": {"type": "string", "description": "仓库绝对路径"},
+            "targets": {"type": "string", "description":
+                        "部署哪些已埋点函数的面板（必须来自用户指定）：逗号分隔的函数名/关键词/文件名，如 'queue'；用户说全部才传 'all'；留空=先列候选让用户选"},
+            "datasource_uid": {"type": "string", "description": "Grafana Loki datasource UID，可留空（默认读环境变量）"},
             "folder_uid": {"type": "string", "description": "Grafana folder UID，可留空"},
             "approved": {"type": "boolean", "description": "只有用户已明确同意部署时才可为 true"},
         },
-        "required": ["dashboard", "approved"],
+        "required": ["repo", "approved"],
     }, structured=True)
 
 

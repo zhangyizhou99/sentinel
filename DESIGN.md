@@ -229,7 +229,7 @@ VectorStore(port)  ← 上层只认接口
 | `gen_alert` | 指标 → PromQL/KQL 告警规则（含分级 Sev） | 否 | — |
 | `gen_dashboard` | 指标 → Grafana 看板 JSON | 否 | — |
 | `instrument` | 代码单元 → 埋点补丁（不落盘） | 否 | — |
-| `apply` | repo+branch → **真改源码**（建分支） | **是** | — |
+| `apply` | repo+targets → **真改源码**（直接改文件，未提交） | **是** | — |
 | `deploy_dashboard` | 看板 JSON → **推 Grafana**（幂等 upsert） | **是** | — |
 | `deploy_alerts` | 告警 policy → **推 Grafana**（联络点/路由） | **是** | — |
 | `blame_route` | 代码单元 → 作者/通知目标（git blame） | 否 | 6 |
@@ -379,7 +379,7 @@ flowchart LR
 - **粒度**：函数级。对准 scan 出的盲区函数（`unit_id`）。
 - **改写方式**：**AST 定位 + 行级插入**（按函数体首行 `lineno` + 缩进插入文本），**不用 `ast.unparse`**（会重排格式、丢注释）；沿用 legacy `editor.py` 的「行级插入 + 从下往上插保行号」手法。
 - **埋点内容**：judge 建议 *what*（该埋什么）× 语义约定 *how*（项目什么风格）。Python 沿用项目 logger 约定；JS/TS/TSX 只有检测到官方 Grafana Faro SDK 与真实 `recordObservability → pushEvent` helper 时才自动补，禁止用 `console.info` 冒充可投递遥测。
-- **安全（复用 legacy 精华）**：git **新分支** + 用户命名 + **未提交**（留工作区给人审）+ **AST 安全网**（改后必须能 parse）+ **幂等**（已埋点跳过）+ 只改有把握的否则跳过 + **破坏性人审门**。
+- **安全**：**直接改工作区文件** + **未提交**（留工作区给人审，`git checkout -- <文件>` 可撤销）+ **AST 安全网**（改后必须能 parse）+ **幂等**（已埋点跳过）+ 只改有把握的否则跳过 + **破坏性人审门**。**不建/不切分支**，且**不要求干净工作区** → 支持增量：先补几个、再补几个，都往当前文件继续改。
 - **三记忆协同**：语义（*什么风格*）× 程序（*怎么补*）× 情节（*补了啥 + 反馈*）→ 越用越会补。
 - **多语言**：扫描与改写分开授权能力。Python 用 `ast`，其它语言通过 tree-sitter grammar/query 动态扩展扫描；改写除语法验证外还要求项目存在可验证的真实 emitter，没有时安全拒绝，不能用 `println`/console 代替。
 - **投递状态**：apply 结果分别给出 `emitter`、`receiver_configured`、`delivery`。源码 emitter 已写入不等于 Grafana 已收到；缺 Faro URL 为 `pending_configuration`，发现 URL 但未做网络验收为 `configured_unverified`。Grafana 看板/告警部署仍属于 roadmap 第 7 步的后续能力。
@@ -457,7 +457,7 @@ flowchart LR
 | | provider 不可用 | `available` 降级；可切**备用 provider/model** |
 | ②工具层（不卡死 Agent） | 工具抛异常 | 统一 try/except → 返回**结构化 `{error}`** 回喂模型，让它换工具/改参/向人解释；**绝不让异常冒泡杀死整个 run** |
 | | 参数非法 | 调用前按 schema 校验，非法直接结构化报错 |
-| | 破坏性写操作 | **幂等**：apply 固定分支名、dashboard 按 uid upsert、告警按 title 跳过 → **重试不会重复执行**（避免帖子说的“重试导致重复写”） |
+| | 破坏性写操作 | **幂等**：apply 已埋点跳过（重复补不会叠加）、dashboard 按 uid upsert、告警按 title 跳过 → **重试不会重复执行**（避免帖子说的“重试导致重复写”） |
 | ③编排层 | 跑飞/死循环 | `max_steps` 上限 + 相同调用去重 |
 | | 单步失败 | **失败步不阻断整体**：记录 observation 继续；Reflect 不达标则重规划 |
 | ④中断与状态恢复 | 进程崩溃/用户中止 | 每次 run + 每步写 episodic(SQLite) = 天然 **checkpoint**；崩溃后可从最后成功步 **resume**（`AgentRun.transcript` 即轨迹） |

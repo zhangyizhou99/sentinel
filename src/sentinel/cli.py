@@ -90,10 +90,10 @@ def cmd_feedback(args: argparse.Namespace) -> None:
 
 
 def cmd_apply(args: argparse.Namespace) -> None:
-    """对盲区函数补埋点：改代码 → 用户命名的新 git 分支，未提交（待人审）。
+    """对盲区函数补埋点：直接改工作区文件，未提交（待人审）。
 
     走完整三记忆：情节（抑制被忽略）+ 语义（学项目埋点约定）+ 程序性（复用/记录修复技能）。
-    “用户敲命令 + 必填 --branch” 即明确同意，是破坏性操作的人审门。
+    “用户敲 apply 命令”即明确同意，是破坏性操作的人审门；改动未提交，可 `git checkout --` 撤销。
     """
     from sentinel.engines.apply import Applier, ApplyError
     from sentinel.engines.conventions import learn_and_store
@@ -113,11 +113,11 @@ def cmd_apply(args: argparse.Namespace) -> None:
     conv = learn_and_store(args.repo, result.units, notes)     # 入乡随俗：学并存约定
     procedural = ProceduralMemory()
 
-    print(f"将对 {len(spots)} 个盲区补埋点，分支：{args.branch}")
+    print(f"将对 {len(spots)} 个盲区补埋点（直接改文件，未提交）")
     if conv.found:
         print(f"（项目埋点约定：{conv.style}）")
     try:
-        res = Applier().apply(args.repo, spots, args.branch, convention=conv, procedural=procedural)
+        res = Applier().apply(args.repo, spots, convention=conv, procedural=procedural)
     except ApplyError as e:
         print(f"❌ 无法补埋点：{e}")
         memory.close()
@@ -134,7 +134,7 @@ def cmd_apply(args: argparse.Namespace) -> None:
         print(f"  telemetry: emitter={res.emitter}, receiver={receiver}, delivery={res.delivery}")
     if res.delivery_note:
         print(f"  {res.delivery_note}")
-    print(f"\n--- diff 预览（未提交，在分支 {res.branch}）---")
+    print(f"\n--- diff 预览（未提交，工作区改动）---")
     print(res.diff[:2000] or "(无 diff)")
     memory.close()
 
@@ -148,11 +148,12 @@ def cmd_telemetry_plan(args: argparse.Namespace) -> None:
 
 
 def cmd_gen_dashboard(args: argparse.Namespace) -> None:
-    """生成 dashboard JSON，可写入文件供人工审阅。"""
-    from sentinel.engines.grafana import generate_dashboard, generate_telemetry_plan
+    """基于已埋点函数生成 dashboard JSON，可写入文件供人工审阅。"""
+    from sentinel.engines.grafana import generate_dashboard, plan_dashboard
 
     _register_languages()
-    result = generate_dashboard(generate_telemetry_plan(args.repo), args.datasource_uid)
+    result = generate_dashboard(
+        plan_dashboard(args.repo, getattr(args, "targets", "") or ""), args.datasource_uid)
     text = json.dumps(result, ensure_ascii=False, indent=2)
     if args.output:
         Path(args.output).write_text(text + "\n", encoding="utf-8")
@@ -204,9 +205,10 @@ def build_parser() -> argparse.ArgumentParser:
     fb.add_argument("--list", action="store_true", help="列出该仓库已有反馈")
     fb.set_defaults(func=cmd_feedback)
 
-    ap = sub.add_parser("apply", help="对盲区函数补埋点（改代码 → 新 git 分支，未提交待人审）")
+    ap = sub.add_parser("apply", help="对盲区函数补埋点（直接改文件，未提交待人审）")
     ap.add_argument("repo", help="仓库路径")
-    ap.add_argument("--branch", required=True, help="补埋点落在哪个新分支（须自己命名）")
+    ap.add_argument("--branch", required=False, default=None,
+                    help="(已废弃，忽略) 补埋点现在直接改文件，不再建分支")
     ap.set_defaults(func=cmd_apply)
 
     telemetry = sub.add_parser("telemetry-plan", help="生成可审阅 telemetry plan（不改代码）")
@@ -215,6 +217,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     dashboard = sub.add_parser("gen-dashboard", help="生成 Grafana dashboard JSON（不部署）")
     dashboard.add_argument("repo", help="仓库路径")
+    dashboard.add_argument("--targets", default="", help="只要哪些已埋点函数（留空=全部；如 'queue' 或 'flush,enqueue'）")
     dashboard.add_argument("--datasource-uid", default="", help="Grafana datasource UID")
     dashboard.add_argument("--output", help="写入 dashboard JSON 文件")
     dashboard.set_defaults(func=cmd_gen_dashboard)
